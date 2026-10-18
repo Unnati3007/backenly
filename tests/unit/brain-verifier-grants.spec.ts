@@ -155,7 +155,7 @@ describe('Brain Verifier: RLS vs Missing GRANT distinction (Issue #244)', () => 
       expect(result.ok).toBe(false)
       expect(result.failureKind).toBe('server_error')
       expect(result.statusCode).toBe(500)
-      expect(result.summary).toContain('Database grant missing')
+      expect(result.summary).toContain('grant is missing')
       expect(result.summary).toContain('permission denied for schema workspace_p1')
     })
 
@@ -179,8 +179,57 @@ describe('Brain Verifier: RLS vs Missing GRANT distinction (Issue #244)', () => 
       expect(result.ok).toBe(false)
       expect(result.failureKind).toBe('server_error')
       expect(result.statusCode).toBe(500)
-      expect(result.summary).toContain('Database grant missing')
+      expect(result.summary).toContain('grant is missing')
       expect(result.summary).toContain('permission denied for table posts')
+    })
+
+    it('reports FAIL as server_error when 500 error is a missing foreign table GRANT', async () => {
+      const grantBody = JSON.stringify({
+        error: 'permission denied for foreign table remote_feed',
+      })
+
+      globalThis.fetch = jest.fn().mockResolvedValue({
+        status: 500,
+        text: async () => grantBody,
+      } as unknown as Response)
+
+      const result = await runEndpointTest({
+        projectId: 'proj_test',
+        tableName: 'posts',
+        operation: 'list',
+        sessionToken: 'test-session-token',
+      })
+
+      expect(result.ok).toBe(false)
+      expect(result.failureKind).toBe('server_error')
+      expect(result.statusCode).toBe(500)
+      expect(result.summary).toContain('grant is missing')
+      expect(result.summary).toContain('permission denied for foreign table remote_feed')
+    })
+
+    it('detects missing GRANT even when error is buried past 320 characters in a long response body', async () => {
+      const longPadding = 'A'.repeat(400)
+      const grantBody = JSON.stringify({
+        debugInfo: longPadding,
+        error: 'permission denied for schema workspace_deep',
+      })
+
+      globalThis.fetch = jest.fn().mockResolvedValue({
+        status: 500,
+        text: async () => grantBody,
+      } as unknown as Response)
+
+      const result = await runEndpointTest({
+        projectId: 'proj_test',
+        tableName: 'posts',
+        operation: 'list',
+        sessionToken: 'test-session-token',
+      })
+
+      expect(result.ok).toBe(false)
+      expect(result.failureKind).toBe('server_error')
+      expect(result.summary).toContain('grant is missing')
+      expect(result.summary).toContain('permission denied for schema workspace_deep')
     })
 
     it('reports FAIL as server_error when 500 error has bare 42501 code without RLS phrasing', async () => {
@@ -208,3 +257,4 @@ describe('Brain Verifier: RLS vs Missing GRANT distinction (Issue #244)', () => 
     })
   })
 })
+

@@ -295,11 +295,12 @@ export async function runEndpointTest(input: EndpointTestInput): Promise<Endpoin
   //   passes.
   // - A bare 42501 with no RLS wording is treated as a server error.
   if (status >= 500) {
-    const missingGrant = extractMissingGrant(excerpt)
+    const bodyToCheck = text || excerpt
+    const missingGrant = extractMissingGrant(bodyToCheck)
     if (missingGrant) {
       return {
         ok: false,
-        summary: `${method} ${path} → ${status}. Database grant missing (${missingGrant}). The endpoint threw a server error because the database role lacks required permissions.${degradedNote}`,
+        summary: `${method} ${path} → ${status}. A database grant is missing (${missingGrant}). The endpoint threw a server error because the database role lacks required permissions.${degradedNote}`,
         endpoint: path,
         method,
         statusCode: status,
@@ -308,7 +309,7 @@ export async function runEndpointTest(input: EndpointTestInput): Promise<Endpoin
       }
     }
 
-    const rlsBlocked = looksLikeRlsDenied(excerpt)
+    const rlsBlocked = looksLikeRlsDenied(bodyToCheck)
     if (rlsBlocked) {
       return {
         ok: true,
@@ -358,9 +359,10 @@ export async function runEndpointTest(input: EndpointTestInput): Promise<Endpoin
 export function extractMissingGrant(body: string): string | null {
   if (!body) return null
   const match =
-    body.match(/permission denied for (?:table|schema|sequence|function|relation|view|database)\s+([^\s"',;}]+|"[^"]+")/i) ||
-    body.match(/permission denied for (?:table|schema|sequence|function|relation|view|database)/i)
-  return match ? match[0] : null
+    body.match(/permission denied for (?:table|schema|sequence|function|relation|view|database|foreign table)\s+([^\s"',;\\}]+|"(?:\\.|[^"\\])*"|\\"(?:\\.|[^"\\])*\\")/i) ||
+    body.match(/permission denied for (?:table|schema|sequence|function|relation|view|database|foreign table)/i)
+  if (!match) return null
+  return match[0].replace(/\\"/g, '"').trim()
 }
 
 /**

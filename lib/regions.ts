@@ -22,7 +22,10 @@
  *   - the Cloud lifecycle creating the project in the chosen region's database
  *     and recording it in Project.region.
  * Until then every project is created in the home region and Project.region
- * stays null, which reads as the home region everywhere.
+ * stays null, which reads as the home region everywhere. Once all of that is
+ * live and the region has qualified, it opens either here, in a release, or on
+ * a running deployment through BACKENLY_OPEN_REGIONS (openedRegions below),
+ * which is how several regions open at the same moment.
  *
  * Self-hosted deployments do not use this list. They run wherever their
  * operator runs them, and the console says "Self-hosted" instead.
@@ -71,6 +74,35 @@ export type RegionCheck =
 type Env = Readonly<Record<string, string | undefined>>
 
 /**
+ * The regions a deployment opens to every customer although this build lists
+ * them as not open, so the regions qualified for a release open together, by
+ * one change of setting once the last of them has passed its go-live checks,
+ * instead of by another build (founders, 2026-10-17: all five regions in one
+ * coordinated launch).
+ *
+ * BACKENLY_OPEN_REGIONS is a comma-separated list of region ids. It only adds:
+ * a region this build lists as open stays open, and an id this build does not
+ * know is ignored. Setting it is the operator's statement that the region's
+ * stack is live and qualified; it does not make a region reachable, and a
+ * project in a region this deployment has no database for still fails to be
+ * created rather than landing elsewhere.
+ */
+export function openedRegions(env: Env = process.env): ReadonlySet<CloudRegionId> {
+  return knownRegions(env.BACKENLY_OPEN_REGIONS)
+}
+
+/** Whether every customer of this deployment may create projects in a region. */
+export function isOpenToCustomers(id: string, env: Env = process.env): boolean {
+  const region = findRegion(id)
+  return region !== undefined && (region.open || openedRegions(env).has(region.id))
+}
+
+/** The list as this deployment serves it: `open` says what customers may choose here. */
+export function regionsAsServed(env: Env = process.env): CloudRegion[] {
+  return CLOUD_REGIONS.map((region) => ({ ...region, open: isOpenToCustomers(region.id, env) }))
+}
+
+/**
  * The regions a staging deployment opens for project creation although they
  * are not open to customers yet, so a region can be qualified end to end
  * before it opens (a region opens only after its stack passes staging).
@@ -83,23 +115,57 @@ type Env = Readonly<Record<string, string | undefined>>
  */
 export function stagingOpenRegions(env: Env = process.env): ReadonlySet<CloudRegionId> {
   if ((env.BACKENLY_ENV ?? '').trim().toLowerCase() !== 'staging') return new Set()
-  const ids = (env.BACKENLY_STAGING_OPEN_REGIONS ?? '').split(',').map((id) => id.trim()).filter(Boolean)
-  return new Set(ids.map((id) => findRegion(id)?.id).filter((id): id is CloudRegionId => id !== undefined))
+  return knownRegions(env.BACKENLY_STAGING_OPEN_REGIONS)
+}
+
+/**
+ * The regions a deployment opens for project creation to named platform users
+ * only, so a production region can be qualified with a probe project before
+ * any customer can choose it (a region opens to customers only in the release
+ * that sets `open` above, after that qualification).
+ *
+ * BACKENLY_PREVIEW_REGIONS (region ids) and BACKENLY_PREVIEW_USER_IDS (platform
+ * user ids) are honoured together or not at all. A region list without a user
+ * list opens nothing, and a caller not named opens nothing, so the setting can
+ * never open a region to customers. Server-side only, like the staging list.
+ */
+export function previewRegionsFor(userId: string | null | undefined, env: Env = process.env): ReadonlySet<CloudRegionId> {
+  if (!userId) return new Set()
+  if (!commaList(env.BACKENLY_PREVIEW_USER_IDS).includes(userId)) return new Set()
+  return knownRegions(env.BACKENLY_PREVIEW_REGIONS)
+}
+
+function commaList(value: string | undefined): string[] {
+  return (value ?? '').split(',').map((item) => item.trim()).filter(Boolean)
+}
+
+/** The ids in a list that name a region this build knows; others are ignored. */
+function knownRegions(value: string | undefined): ReadonlySet<CloudRegionId> {
+  return new Set(commaList(value).map((id) => findRegion(id)?.id).filter((id): id is CloudRegionId => id !== undefined))
 }
 
 /**
  * The region a create request asked for. Omitted means the home region. A
  * region that is not on the list, or not open yet, is refused rather than
  * quietly replaced, so a caller never gets a project in a place it did not ask
- * for.
+ * for. `callerUserId` is the platform user making the request, for the
+ * preview list.
  */
-export function checkRequestedRegion(requested: string | null | undefined, env: Env = process.env): RegionCheck {
+export function checkRequestedRegion(
+  requested: string | null | undefined,
+  env: Env = process.env,
+  callerUserId?: string | null,
+): RegionCheck {
   if (requested === undefined || requested === null || requested === '') return { ok: true, region: HOME_REGION }
   const region = findRegion(requested)
   if (!region) {
     return { ok: false, code: 'UNKNOWN_REGION', message: `There is no Backenly Cloud region called "${requested}".` }
   }
-  if (!region.open && !stagingOpenRegions(env).has(region.id)) {
+  if (
+    !isOpenToCustomers(region.id, env) &&
+    !stagingOpenRegions(env).has(region.id) &&
+    !previewRegionsFor(callerUserId, env).has(region.id)
+  ) {
     return {
       ok: false,
       code: 'REGION_NOT_OPEN',

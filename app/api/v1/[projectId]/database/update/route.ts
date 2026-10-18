@@ -4,8 +4,10 @@ import { NextRequest } from 'next/server'
 import { v1ApiMiddleware, requirePermission, requireCapability } from '@/lib/api/v1/middleware'
 import { createErrorResponse, createSuccessResponse, handleValidationError, ErrorCodes } from '@/lib/api/v1/errors'
 import { updateSchema } from '@/lib/api/v1/schemas'
+import { typedParams } from '@/lib/api/v1/typed-params'
 import { validateRequestBody } from '@/lib/validation/schemas'
 import { prisma } from '@/lib/db'
+import { columnTypes } from '@/lib/mcp/runtime-db'
 import { executeWithUserContext } from '@/lib/services/workspace-rls'
 import { validateUpdatePayload } from '@/lib/services/workspace-validator'
 import { recordedV1 } from '@/lib/traffic/recorded-v1'
@@ -80,21 +82,17 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
       return createErrorResponse(ErrorCodes.VALIDATION_ERROR, 'No valid fields to update', 400)
     }
 
-    const values: any[] = []
-    let paramIdx = 1
+    // Each value is cast to its column's type (lib/api/v1/typed-params.ts).
+    const bound = typedParams(await columnTypes(context.projectId, schemaName, tableName))
 
-    const setParts = setCols.map(c => {
-      values.push(data[c])
-      return `"${c}" = $${paramIdx++}`
-    })
+    const setParts = setCols.map(c => `"${c}" = ${bound.bind(c, data[c])}`)
 
     // Build WHERE clause
     const whereParts: string[] = []
     if (where && typeof where === 'object') {
       for (const [col, val] of Object.entries(where)) {
         if (!/^[a-z_][a-z0-9_]*$/i.test(col)) continue
-        whereParts.push(`"${col}" = $${paramIdx++}`)
-        values.push(val)
+        whereParts.push(`"${col}" = ${bound.bind(col, val)}`)
       }
     }
 
@@ -105,7 +103,7 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
       context.endUserId ?? '',
       context.apiKey.serviceRole,
       sql,
-      values,
+      bound.values,
       context.endUserRole ?? 'user'
     )
 

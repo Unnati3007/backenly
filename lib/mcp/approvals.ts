@@ -30,8 +30,10 @@
 
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db/prisma'
+import { NOT_QUOTED, quotesKeptHere } from '@/lib/data-plane/residency'
 import { dispatchTool, type ToolDispatchContext, type ToolResult } from '@/lib/ai/brain/tools'
 import { withholdSecrets } from '@/lib/mcp/withhold-secrets'
+import { withHeldActions } from '@/lib/operational-memory/held-action-targets'
 
 export const APPROVAL_TTL_MS = 24 * 60 * 60 * 1000
 
@@ -91,6 +93,10 @@ export async function createApprovalRequest(input: {
     },
   })
 
+  // The request itself keeps its target, which is what the approver reads. The
+  // audit copy of it is left out for a project kept in another region, where
+  // it can name a row or a file (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(input.projectId)
   await prisma.auditLog.create({
     data: {
       projectId: input.projectId,
@@ -100,7 +106,7 @@ export async function createApprovalRequest(input: {
       details: JSON.stringify({
         approvalId: row.id,
         tool: input.danger.tool,
-        target: input.danger.target,
+        ...(quote ? { target: input.danger.target } : {}),
         rowCount: input.danger.rowCount,
         at: new Date().toISOString(),
       }),
@@ -142,7 +148,9 @@ async function notifyOwnerOfRequest(row: { id: string; projectId: string; tool: 
     projectName: project.name,
     approvalId: row.id,
     tool: row.tool,
-    target: row.target,
+    // The action only for a project kept in another region: the target can
+    // name a row or a file, and the request keeps it (lib/data-plane/residency.ts).
+    target: (await quotesKeptHere(row.projectId)) ? row.target : null,
     expiresAt: row.expiresAt,
   })
 }
@@ -225,10 +233,15 @@ export async function getApprovalForProject(projectId: string, id: string) {
  * an id the agent can poll instead of vanishing from its point of view.
  */
 export async function getParkedActionForProject(projectId: string, id: string) {
-  const row = await prisma.healthFinding.findFirst({
+  const found = await prisma.healthFinding.findFirst({
     where: { id, projectId, type: 'ai_action_pending' },
   })
-  if (!row) return null
+  if (!found) return null
+  // A regional project's parked action keeps its target in its region, read
+  // back for the agent that asked for it; when the region cannot be read the
+  // target is not given, rather than its stand-in
+  // (lib/operational-memory/held-action-targets.ts).
+  const [row] = await withHeldActions(projectId, [found])
   const details = (row.details as Record<string, unknown> | null) ?? {}
   const statusMap: Record<string, string> = {
     pending_approval: 'pending',
@@ -247,7 +260,7 @@ export async function getParkedActionForProject(projectId: string, id: string) {
         : typeof details.title === 'string'
           ? details.title
           : row.type,
-    target: typeof details.location === 'string' ? details.location : null,
+    target: typeof details.location === 'string' && details.keptInRegion !== true ? details.location : null,
     createdAt: row.detectedAt.toISOString(),
     resultSummary: null,
   }
@@ -352,9 +365,13 @@ export async function decideApproval(input: {
     destructiveConfirmed: true,
     createdThisTurn: new Set<string>(),
   })
+  // The approver gets the full result now. What is stored for later readers is
+  // the status alone for a project kept in another region, whose result can
+  // quote its rows (lib/data-plane/residency.ts).
+  const stored = (await quotesKeptHere(input.projectId)) ? storableResultSummary(outcome.summary) : NOT_QUOTED
   await prisma.agentApprovalRequest.update({
     where: { id: row.id },
-    data: { status: outcome.status, executedAt: new Date(), resultSummary: storableResultSummary(outcome.summary) },
+    data: { status: outcome.status, executedAt: new Date(), resultSummary: stored },
   })
   return { ok: outcome.status === 'executed', status: outcome.status, resultSummary: outcome.summary }
 }
@@ -371,13 +388,16 @@ async function auditDecision(
   target: string,
   action: ApprovalAuditAction,
 ) {
+  // No copy of the target for a project kept in another region: the request
+  // row has it (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(input.projectId)
   await prisma.auditLog.create({
     data: {
       projectId: input.projectId,
       userId: input.approverUserId,
       action,
       type: 'mcp',
-      details: JSON.stringify({ approvalId: input.approvalId, tool, target, at: new Date().toISOString() }),
+      details: JSON.stringify({ approvalId: input.approvalId, tool, ...(quote ? { target } : {}), at: new Date().toISOString() }),
       timestamp: new Date(),
     },
   }).catch(() => {})

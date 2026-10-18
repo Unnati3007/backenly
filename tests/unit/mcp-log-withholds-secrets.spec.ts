@@ -19,6 +19,8 @@ jest.mock('@/lib/db/prisma', () => ({
   prisma: {
     apiKeyUsage: { create: jest.fn(async (a: any) => { mockUsageRows.push(a.data); return a.data }) },
     auditLog: { create: jest.fn(async (a: any) => { mockAuditRows.push(a.data); return a.data }) },
+    // The project's region: p-virginia is kept in us-east-1, every other one at home.
+    project: { findUnique: jest.fn(async ({ where }: any) => ({ region: where.id === 'p-virginia' ? 'us-east-1' : null })) },
   },
 }))
 
@@ -82,9 +84,13 @@ describe('what is withheld', () => {
   })
 })
 
+// recordMcpCall is fire-and-forget: its rows land once the project's region is read.
+const flush = () => new Promise((resolve) => setImmediate(resolve))
+
 describe('what recordMcpCall stores', () => {
-  it('keeps the new key out of the usage row and the audit row', () => {
+  it('keeps the new key out of the usage row and the audit row', async () => {
     recordMcpCall(CTX, { statusCode: 200, tool: 'connect.create_api_key', mutation: true, summary: createSummary, data: { apiKey: KEY } })
+    await flush()
     expect(JSON.stringify(mockUsageRows)).not.toContain(KEY)
     expect(JSON.stringify(mockAuditRows)).not.toContain(KEY)
     expect(mockUsageRows[0].metadata.summary).toContain('[withheld]')
@@ -92,9 +98,34 @@ describe('what recordMcpCall stores', () => {
     expect(JSON.stringify(mockUsageRows[0])).not.toContain('"data"')
   })
 
-  it('withholds the same way from an error', () => {
+  it('withholds the same way from an error', async () => {
     recordMcpCall(CTX, { statusCode: 400, tool: 'x', error: `failed near ${KEY}` })
+    await flush()
     expect(mockUsageRows[0].metadata.error).toBe('failed near [withheld]')
+  })
+
+  it('keeps no summary or error at all for a project kept in another region, only what ran', async () => {
+    // Both can quote the project's rows, which stay in its region (lib/data-plane/residency.ts).
+    const virginia = { ...CTX, projectId: 'p-virginia' }
+    recordMcpCall(virginia, { statusCode: 200, tool: 'db.insert', mutation: true, summary: 'Inserted alice@example.com' })
+    recordMcpCall(virginia, { statusCode: 409, tool: 'db.insert', error: 'Key (email)=(alice@example.com) already exists' })
+    await flush()
+    expect(mockUsageRows.map((row) => row.metadata)).toEqual([
+      { tool: 'db.insert', mutation: true, summary: undefined, error: undefined },
+      { tool: 'db.insert', mutation: false, summary: undefined, error: undefined },
+    ])
+    expect(JSON.parse(mockAuditRows[0].details)).toMatchObject({ tool: 'db.insert' })
+    expect(JSON.stringify([mockUsageRows, mockAuditRows])).not.toContain('alice@example.com')
+  })
+
+  it('still keeps an error code for a project kept in another region, which quotes nothing', async () => {
+    // The admin agent-ops view tells a partly applied migration from a refusal by this code.
+    const virginia = { ...CTX, projectId: 'p-virginia' }
+    recordMcpCall(virginia, { statusCode: 500, tool: 'apply_migration', mutation: true, error: 'MIGRATION_FAILED', summary: 'migration: 3 statement(s), failed at alice@example.com' })
+    recordMcpCall(virginia, { statusCode: 403, tool: 'db.delete', error: 'READ_ONLY_KEY' })
+    await flush()
+    expect(mockUsageRows.map((row) => row.metadata.error)).toEqual(['MIGRATION_FAILED', 'READ_ONLY_KEY'])
+    expect(JSON.stringify(mockUsageRows)).not.toContain('alice@example.com')
   })
 })
 

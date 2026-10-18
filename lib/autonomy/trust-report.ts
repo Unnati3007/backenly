@@ -14,6 +14,7 @@
  */
 
 import { redactSecretParams } from '@/lib/mcp/withhold-secrets'
+import { withHeldActions } from '@/lib/operational-memory/held-action-targets'
 import { prisma } from '@/lib/db/prisma'
 import { AUTONOMOUS_AUDIT_ACTIONS } from './circuit-breaker'
 import {
@@ -492,12 +493,14 @@ export async function buildTrustReport(
       take: 25,
       select: { action: true, details: true, timestamp: true },
     }),
+    // A regional project's held actions with the target and arguments the
+    // approver reads, from its region (lib/operational-memory/held-action-targets.ts).
     prisma.healthFinding.findMany({
       where: { projectId, status: 'pending_approval' },
       orderBy: [{ severity: 'asc' }, { detectedAt: 'desc' }],
       take: 25,
       select: { id: true, type: true, severity: true, detectedAt: true, details: true },
-    }),
+    }).then(rows => withHeldActions(projectId, rows)),
     // Ordered by fixAppliedAt, not detectedAt: a finding raised last week and
     // healed a minute ago belongs at the top of "what just changed".
     // `nulls: 'last'` keeps legacy rows (fixed before the column was stamped)
@@ -510,7 +513,7 @@ export async function buildTrustReport(
         id: true, type: true, severity: true,
         detectedAt: true, fixAppliedAt: true, details: true,
       },
-    }),
+    }).then(rows => withHeldActions(projectId, rows)),
     prisma.auditLog.findFirst({
       where: { projectId, action: 'AUTONOMY_SHADOW_DECISION' },
       orderBy: { timestamp: 'desc' },

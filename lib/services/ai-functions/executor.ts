@@ -30,6 +30,7 @@ import { buildIntegrationContext, IntegrationContext } from './integration-conte
 import { getProviderSpec } from './integration-registry'
 import { generateFixedFunctionCode } from './generator'
 import { isRouteModuleFunction, executeRouteModuleFunction, validateRouteModule } from './route-module-runner'
+import { recordFunctionRun, rowLastError, runTextKeptInRegion, withLastErrors } from './run-records'
 import { isFunctionSwitchedOff } from './status'
 import { enforceAiFunctionInvocation, trackAiFunctionInvocation } from '@/lib/entitlements/policy'
 import { recordUsage } from '@/lib/usage/ledger'
@@ -536,6 +537,9 @@ async function recordSelfHealRewrite(
   fixedCode: string,
 ): Promise<void> {
   const sha = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex')
+  // A regional project's error text stays in its region (./run-records.ts);
+  // the audit row keeps what was rewritten, by hash.
+  const keptInRegion = await runTextKeptInRegion(projectId).catch(() => true)
   await prisma.auditLog.create({
     data: {
       projectId,
@@ -545,7 +549,7 @@ async function recordSelfHealRewrite(
         functionId,
         name,
         reason: 'regenerated from a runtime error',
-        error: errorMessage.slice(0, 300),
+        error: keptInRegion ? null : errorMessage.slice(0, 300),
         previousCodeSha256: sha(originalCode),
         newCodeSha256: sha(fixedCode),
       }),
@@ -580,24 +584,26 @@ async function autoFixAiFunction(
     if (!fixedCode || fixedCode === originalCode) {
       await prisma.aiFunction.update({
         where: { id: functionId },
-        data: { lastError: `AUTO-FIX-FAILED: Could not generate a fix for: ${errorMessage}`, status: 'error' },
+        data: {
+          lastError: await rowLastError(projectId, functionId, `AUTO-FIX-FAILED: Could not generate a fix for: ${errorMessage}`, 'AUTO-FIX-FAILED: '),
+          status: 'error',
+        },
       })
       return
     }
 
     await prisma.aiFunction.update({
       where: { id: functionId },
-      data: { generatedCode: fixedCode, status: 'active', lastError: null },
+      data: { generatedCode: fixedCode, status: 'active', lastError: await rowLastError(projectId, functionId, null) },
     })
     await recordSelfHealRewrite(projectId, functionId, row.name, errorMessage, originalCode, fixedCode)
 
     console.log(`[AutoFix] Successfully fixed function ${functionId}`)
   } catch (err: any) {
     console.warn(`[AutoFix] Fix failed for function ${functionId}:`, err?.message)
-    await prisma.aiFunction.update({
-      where: { id: functionId },
-      data: { lastError: `AUTO-FIX-FAILED: ${err?.message || 'unknown error'}`, status: 'error' },
-    }).catch(() => {})
+    await rowLastError(projectId, functionId, `AUTO-FIX-FAILED: ${err?.message || 'unknown error'}`, 'AUTO-FIX-FAILED: ')
+      .then((lastError) => prisma.aiFunction.update({ where: { id: functionId }, data: { lastError, status: 'error' } }))
+      .catch(() => {})
   }
 }
 
@@ -627,24 +633,26 @@ export async function autoFixRouteModuleFunction(
     if (!fixedCode) {
       await prisma.aiFunction.update({
         where: { id: functionId },
-        data: { lastError: `AUTO-FIX-FAILED: Could not generate a validated fix for: ${errorMessage}`, status: 'error' },
+        data: {
+          lastError: await rowLastError(projectId, functionId, `AUTO-FIX-FAILED: Could not generate a validated fix for: ${errorMessage}`, 'AUTO-FIX-FAILED: '),
+          status: 'error',
+        },
       })
       return false
     }
 
     await prisma.aiFunction.update({
       where: { id: functionId },
-      data: { generatedCode: fixedCode, status: 'active', lastError: null },
+      data: { generatedCode: fixedCode, status: 'active', lastError: await rowLastError(projectId, functionId, null) },
     })
     await recordSelfHealRewrite(projectId, functionId, row.name, errorMessage, originalCode, fixedCode)
     console.log(`[AutoFix:RouteModule] Successfully fixed function ${functionId}`)
     return true
   } catch (err: any) {
     console.warn(`[AutoFix:RouteModule] Fix failed for function ${functionId}:`, err?.message)
-    await prisma.aiFunction.update({
-      where: { id: functionId },
-      data: { lastError: `AUTO-FIX-FAILED: ${err?.message || 'unknown error'}`, status: 'error' },
-    }).catch(() => {})
+    await rowLastError(projectId, functionId, `AUTO-FIX-FAILED: ${err?.message || 'unknown error'}`, 'AUTO-FIX-FAILED: ')
+      .then((lastError) => prisma.aiFunction.update({ where: { id: functionId }, data: { lastError, status: 'error' } }))
+      .catch(() => {})
     return false
   }
 }
@@ -687,11 +695,14 @@ export async function healErroredAiFunctions(
   maxLlmFixes = 3
 ): Promise<FunctionHealResult> {
   const result: FunctionHealResult = { scanned: 0, restored: 0, regenerated: 0, failed: 0 }
-  const errored = await prisma.aiFunction.findMany({
+  // The real error text, read from the project's region when kept there: the
+  // runner-contract match below needs it.
+  const errored = await withLastErrors(projectId, await prisma.aiFunction.findMany({
     where: { projectId, status: 'error', lastError: { not: null } },
     orderBy: { updatedAt: 'asc' },
     take: 20,
-  })
+  }))
+  const keptInRegion = await runTextKeptInRegion(projectId).catch(() => true)
   result.scanned = errored.length
   let llmBudget = maxLlmFixes
 
@@ -703,7 +714,7 @@ export async function healErroredAiFunctions(
         if (check.valid && RUNNER_CONTRACT_BUG_RE.test(lastError)) {
           await prisma.aiFunction.update({
             where: { id: fn.id },
-            data: { status: 'active', lastError: null },
+            data: { status: 'active', lastError: await rowLastError(projectId, fn.id, null) },
           })
           await prisma.auditLog.create({
             data: {
@@ -714,7 +725,7 @@ export async function healErroredAiFunctions(
                 functionId: fn.id,
                 name: fn.name,
                 reason: 'runner-contract bug (fixed platform-side); stored code re-validated clean',
-                clearedError: lastError,
+                clearedError: keptInRegion ? null : lastError,
               }),
               timestamp: new Date(),
             },
@@ -829,6 +840,7 @@ export async function executeAiFunction(
         where: { id: functionId },
         data: { runCount: { increment: 1 }, lastRun: new Date(), lastError: null, status: 'active' },
       }).catch(() => {})
+      if (fn.lastError !== null) rowLastError(projectId, functionId, null).catch(() => {})
       // `httpStatus` is the status the HANDLER chose. It is surfaced separately
       // from `success` because the two answer different questions: `success`
       // means the function ran without throwing, `httpStatus` means what it
@@ -839,10 +851,12 @@ export async function executeAiFunction(
       const durationMs = Date.now() - startMs
       const errorMsg = err?.message || 'Route function error'
       await persistExecutionLog(functionId, projectId, false, [], errorMsg, durationMs, event.type)
-      prisma.aiFunction.update({
-        where: { id: functionId },
-        data: { runCount: { increment: 1 }, lastRun: new Date(), lastError: errorMsg, status: 'error' },
-      }).catch(() => {})
+      rowLastError(projectId, functionId, errorMsg)
+        .then((lastError) => prisma.aiFunction.update({
+          where: { id: functionId },
+          data: { runCount: { increment: 1 }, lastRun: new Date(), lastError, status: 'error' },
+        }))
+        .catch(() => {})
       // Self-heal: regenerate through the route-module-aware fixer (the NL
       // auto-fixer would rewrite the module into a ctx.* sandbox body and
       // corrupt it — never use it here). Guarded so a failed fix can't loop.
@@ -897,6 +911,7 @@ export async function executeAiFunction(
         where: { id: functionId },
         data: { runCount: { increment: 1 }, lastRun: new Date(), lastError: null, status: 'active' },
       }).catch(() => {})
+      if (fn.lastError !== null) rowLastError(projectId, functionId, null).catch(() => {})
 
       return { success: true, logs, returnValue, durationMs }
     } catch (err: any) {
@@ -915,10 +930,12 @@ export async function executeAiFunction(
   // Persist error log
   await persistExecutionLog(functionId, projectId, false, logs, errorMsg, durationMs, event.type)
 
-  prisma.aiFunction.update({
-    where: { id: functionId },
-    data: { runCount: { increment: 1 }, lastRun: new Date(), lastError: errorMsg, status: 'error' },
-  }).catch(() => {})
+  rowLastError(projectId, functionId, errorMsg)
+    .then((lastError) => prisma.aiFunction.update({
+      where: { id: functionId },
+      data: { runCount: { increment: 1 }, lastRun: new Date(), lastError, status: 'error' },
+    }))
+    .catch(() => {})
 
   const previousError = fn.lastError ?? ''
   if (caller.selfHeal !== false && !previousError.startsWith('AUTO-FIX')) {
@@ -942,21 +959,8 @@ async function persistExecutionLog(
   durationMs: number,
   triggerType: string
 ): Promise<void> {
-  try {
-    await prisma.aiFunctionLog.create({
-      data: {
-        functionId,
-        projectId,
-        success,
-        logs,
-        error: error ?? null,
-        durationMs,
-        triggerType,
-      },
-    })
-  } catch {
-    // Non-fatal — log persistence must never block execution
-  }
+  // Where the project's data is kept, and never fatal (./run-records.ts).
+  await recordFunctionRun({ functionId, projectId, success, logs, error, durationMs, triggerType })
 }
 
 // ─── Batch Fire Helpers ───────────────────────────────────────────────────────

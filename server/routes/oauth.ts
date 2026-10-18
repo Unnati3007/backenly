@@ -12,6 +12,7 @@ import {
   buildUserInsert,
   stampLastLogin,
   isReservedTestEmail,
+  userIdCast,
 } from '@/lib/services/end-user-auth-table'
 import { canAcceptNewEndUser, trackEndUserActive } from '@/lib/quota/kernel'
 import { emitEndUserCreated } from '@/lib/services/end-user-auth-events'
@@ -491,7 +492,7 @@ async function handleOAuthCallback(req: Request, res: Response) {
       projectId,
       '',
       true,
-      `SELECT id, email, name FROM "${schemaName}"."users" WHERE oauth_id = $1 OR email = $2 LIMIT 1`,
+      `SELECT id, email, name${schema.hasIsBlocked ? ', is_blocked' : ''} FROM "${schemaName}"."users" WHERE oauth_id = $1 OR email = $2 LIMIT 1`,
       [providerUser.id, providerUser.email],
     )
 
@@ -501,16 +502,21 @@ async function handleOAuthCallback(req: Request, res: Response) {
 
     if (existing.length > 0) {
       const row = existing[0]
+      // A suspended account is refused before it is linked or signed in, with
+      // the answer sign-in and refresh give it.
+      if (row.is_blocked) return jsonError(res, 403, 'This account has been suspended.', 'FORBIDDEN')
       userId = String(row.id)
       userEmail = row.email
       userName = row.name
       const setParts = ['oauth_provider = $1', 'oauth_id = $2', 'avatar_url = COALESCE(avatar_url, $3)']
       if (schema.updatedAtColumn) setParts.push(`"${schema.updatedAtColumn}" = NOW()`)
+      // The id bound as the column's own type: a bare $4 arrives as text, and
+      // on a uuid `id` (the canonical shape) the link failed with 42883.
       await executeWithUserContext(
         projectId,
         '',
         true,
-        `UPDATE "${schemaName}"."users" SET ${setParts.join(', ')} WHERE id = $4`,
+        `UPDATE "${schemaName}"."users" SET ${setParts.join(', ')} WHERE id = $4${userIdCast(schema)}`,
         [provider, providerUser.id, providerUser.avatarUrl || null, userId],
       )
     } else {

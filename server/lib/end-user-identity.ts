@@ -10,11 +10,12 @@
 
 import crypto from 'crypto'
 import { verify } from 'jsonwebtoken'
-import { prisma } from '@/lib/db'
 import { workspaceRawClient } from '@/lib/data-plane/regional'
+import { authorizingProject } from '@/lib/auth-projection/read'
 import { resolveJwtSecret } from '@/lib/services/jwtSecretManager'
 import { noteEndUserActivity } from '@/lib/quota/kernel'
 import { crossEnvironmentToken, endUserTokenSecret } from '@/lib/branches/auth-environment'
+import { readEndUserBlocked } from '@/lib/services/end-user-blocked'
 
 export interface EndUserIdentity {
   userId: string
@@ -49,10 +50,8 @@ export async function resolveEndUserFromToken(
 ): Promise<EndUserIdentity | 'blocked' | null> {
   if (!rawTokenInput) return null
   const rawToken = bareToken(rawTokenInput)
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { jwtSecret: true },
-  })
+  // The region's copy while it is fresh, home otherwise (lib/auth-projection/read.ts).
+  const project = await authorizingProject(projectId)
   if (!project?.jwtSecret) return null
   let payload: any
   try {
@@ -107,18 +106,15 @@ export async function resolveEndUserFromToken(
   // (block_end_user's description and its success message) — which is only
   // true if request-time resolution checks it. Before this check, is_blocked
   // was read at sign-in and refresh alone, so a blocked user's live token
-  // kept working for up to seven days. A missing table or column means
-  // nobody was ever blocked; any other failure fails open like the
-  // revocation check above, and just as loudly.
+  // kept working for up to seven days. Read as the service role: the users
+  // table is row-level secured against the app role (lib/services/end-user-blocked.ts).
+  // A missing table or column means nobody was ever blocked; any other failure
+  // fails open like the revocation check above, and just as loudly.
   try {
     const schemaName = branch?.schemaName ?? `workspace_${projectId}`
-    const rows = await db.$queryRawUnsafe<{ is_blocked: boolean | null }[]>(
-      `SELECT is_blocked FROM "${schemaName}"."users" WHERE id::text = $1 LIMIT 1`,
-      String(payload.userId),
-    )
     // 'blocked', not null: the caller answers 403 — the promised behavior —
     // instead of silently serving the request as an anonymous caller.
-    if (rows[0]?.is_blocked === true) return 'blocked'
+    if (await readEndUserBlocked(db, schemaName, String(payload.userId))) return 'blocked'
   } catch (err: any) {
     const text = String(err?.message ?? err)
     const absent = err?.code === '42P01' || err?.code === '42703' || text.includes('42P01') || text.includes('42703')
@@ -148,10 +144,7 @@ export async function crossEnvironmentUserToken(
   rawTokenInput: string,
   branch: EndUserBranch | null,
 ): Promise<{ code: string; error: string } | null> {
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { jwtSecret: true },
-  })
+  const project = await authorizingProject(projectId)
   if (!project?.jwtSecret) return null
   return crossEnvironmentToken(bareToken(rawTokenInput), resolveJwtSecret(project.jwtSecret), branch)
 }

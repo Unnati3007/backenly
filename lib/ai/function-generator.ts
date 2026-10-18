@@ -16,7 +16,9 @@
  *   4. Listed alongside generated CRUD APIs in the project dashboard
  */
 
+import crypto from 'crypto'
 import { prisma } from '@/lib/db'
+import { recordFunctionRun, rowLastError } from '@/lib/services/ai-functions/run-records'
 
 import { chat } from '@/lib/ai/llm/chat'
 export interface GeneratedFunction {
@@ -560,8 +562,12 @@ export async function executeGenerateFunction(
     // functions {action:'logs'} then show the truth instead of a healthy row.
     const storedStatus = verification === 'failed' ? 'error' : 'active'
     const storedError = verification === 'failed' ? `SMOKE_TEST_FAILED: ${verificationError ?? 'unknown error'}`.slice(0, 500) : null
-    // Only an existing HTTP route reaches here (see the check above).
+    // Only an existing HTTP route reaches here (see the check above). The id
+    // is chosen first so the error text can be kept, for a regional project,
+    // in its region before the row names it (run-records.ts).
     const existing = existingFn
+    const functionId = existing ? existing.id : crypto.randomUUID()
+    const rowError = await rowLastError(projectId, functionId, storedError, 'SMOKE_TEST_FAILED: ')
     const fn = existing
       ? await prisma.aiFunction.update({
           where: { id: existing.id },
@@ -571,11 +577,12 @@ export async function executeGenerateFunction(
             triggerType: 'manual',
             triggerTable: `${method} ${endpoint}`,
             status: storedStatus,
-            lastError: storedError,
+            lastError: rowError,
           },
         })
       : await prisma.aiFunction.create({
           data: {
+            id: functionId,
             projectId,
             name: functionName,
             description,
@@ -583,27 +590,25 @@ export async function executeGenerateFunction(
             triggerType: 'manual',
             triggerTable: `${method} ${endpoint}`,
             status: storedStatus,
-            lastError: storedError,
+            lastError: rowError,
           },
         })
 
     // The creation checks are runs of this function: record them where its
     // other runs are, so nothing it did at creation is invisible.
     for (const run of smokeRuns) {
-      await prisma.aiFunctionLog.create({
-        data: {
-          functionId: fn.id,
-          projectId,
-          success: run.ok,
-          logs: [
-            `Creation check (${run.probe}): ` +
-              (run.untested ? 'could not run' : run.status ? `HTTP ${run.status}` : run.ok ? 'ran' : 'failed'),
-          ],
-          error: run.ok ? null : (run.error ?? null),
-          durationMs: run.durationMs,
-          triggerType: 'creation_check',
-        },
-      }).catch(() => { /* the log must never block creation */ })
+      await recordFunctionRun({
+        functionId: fn.id,
+        projectId,
+        success: run.ok,
+        logs: [
+          `Creation check (${run.probe}): ` +
+            (run.untested ? 'could not run' : run.status ? `HTTP ${run.status}` : run.ok ? 'ran' : 'failed'),
+        ],
+        error: run.ok ? null : (run.error ?? null),
+        durationMs: run.durationMs,
+        triggerType: 'creation_check',
+      })
     }
 
     const result: GeneratedFunction = {

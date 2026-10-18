@@ -19,6 +19,7 @@ import { canAccessProject, canWriteProject } from '@/lib/edition/guard'
 import { workspaceSchemaName } from '@/lib/security/workspace-schema'
 import { executeAiFunction, validateSandboxFunction } from './executor'
 import { isRouteModuleFunction, validateRouteModule } from './route-module-runner'
+import { rowLastError, withLastErrors, withRunBodies } from './run-records'
 import { isFunctionSwitchedOff } from './status'
 import { workspaceRawClient } from '@/lib/data-plane/regional'
 import { functionNameForms, resolveFunctionByName } from './names'
@@ -93,10 +94,12 @@ export async function getFunction(
 ): Promise<FunctionActionResult> {
   const denied = await refused(actor, false)
   if (denied) return denied
-  const fn = await findFunction(actor.projectId, args)
-  if (fn === undefined) return needsTarget
-  if (!fn) return notFound(args)
-  if ('ambiguous' in fn) return ambiguousName(fn.ambiguous)
+  const found = await findFunction(actor.projectId, args)
+  if (found === undefined) return needsTarget
+  if (!found) return notFound(args)
+  if ('ambiguous' in found) return ambiguousName(found.ambiguous)
+  // A regional project's last error is read from its region (./run-records.ts).
+  const [fn] = await withLastErrors(actor.projectId, [found])
 
   const endpoint = httpEndpoint(fn.triggerTable)
   return {
@@ -206,12 +209,13 @@ export async function listFunctionLogs(
     ? Math.min(Math.max(Math.trunc(args.limit), 1), MAX_LOGS)
     : 25
 
-  const logs = await prisma.aiFunctionLog.findMany({
+  // A regional project's run logs and errors are read from its region.
+  const logs = await withRunBodies(actor.projectId, await prisma.aiFunctionLog.findMany({
     where: { projectId: actor.projectId, ...(functionId ? { functionId } : {}) },
     orderBy: { createdAt: 'desc' },
     take,
     include: { function: { select: { name: true } } },
-  })
+  }))
   const lines = logs.slice(0, 10).map((l) =>
     `• ${l.createdAt.toISOString()} ${l.function.name}: ${l.success ? 'ok' : 'FAILED'}, ${l.durationMs}ms, ${l.triggerType}` +
     (l.error ? `, ${l.error.slice(0, 100)}` : ''))
@@ -456,6 +460,8 @@ export async function deployFunctionCode(
   const fn = existing
     ? await prisma.aiFunction.update({ where: { id: existing.id }, data: { ...fields, ...(keptOff ? {} : { status: 'active' }) } })
     : await prisma.aiFunction.create({ data: { projectId: actor.projectId, name, status: 'active', ...fields } })
+  // New code clears the last error, in the project's region too.
+  if (existing?.lastError) await rowLastError(actor.projectId, existing.id, null)
 
   // Row-event functions fire from the database-level capture, so deploying one
   // must make sure the capture trigger is on the tables. Awaited: a deploy that

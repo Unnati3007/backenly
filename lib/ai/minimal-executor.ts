@@ -3211,7 +3211,12 @@ export async function executeAction(
           console.log('[Replanning] Generated new action:', newAction.action)
 
           // Retry with the replanned action — pass executionId so all attempts share a run
-          return await executeAction(newAction, projectId, apiKey, retryCount + 1, runId, allowReplan)
+          //
+          // The replacement carries no approval: one given for the failed action
+          // was for that action, and a model's output cannot grant one. So a
+          // medium- or high-risk replacement waits for the owner in the gate
+          // below like any other unconfirmed action.
+          return await executeAction(withoutApprovalParams(newAction), projectId, apiKey, retryCount + 1, runId, allowReplan)
         } catch (replanError: any) {
           console.error('[Replanning] Failed to replan:', replanError.message)
           // Fall through to return original error
@@ -3290,6 +3295,27 @@ export async function executeAction(
       error: error.message,
     }
   }
+}
+
+/**
+ * The params that carry an approval, or name who gave one. `confirmed` opens
+ * the executor's approval gates, and the deploy, rollback and frontend
+ * connection executors also take `force` as the go-ahead. Deploy and rollback
+ * record `actorVia` and `actorUserId` as who authorised the call. runExecutor
+ * (lib/ai/brain/tools.ts) sets them from how the call was authorised.
+ */
+const APPROVAL_PARAMS = ['confirmed', 'force', 'actorVia', 'actorUserId'] as const
+
+/**
+ * A replanned action as it may run: a model picked it from an error, so it
+ * keeps none of the approval params its output may name.
+ */
+export function withoutApprovalParams(action: AIAction): AIAction {
+  const params = action?.params
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return action
+  const kept: Record<string, any> = { ...params }
+  for (const key of APPROVAL_PARAMS) delete kept[key]
+  return { ...action, params: kept }
 }
 
 /**
@@ -3733,8 +3759,18 @@ async function executeSingleAction(
 
       // ========== DATABASE BACKUPS ==========
       case 'BACKUP_DATABASE': {
-        const { backupWorkspace, snapshotForJson } = await import('@/lib/services/workspace-backup')
-        const result = await backupWorkspace(projectId)
+        // A project kept in another region is snapshotted there, as a queued
+        // job: its dump never leaves its region (lib/services/workspace-backup.ts).
+        const { requestBackup, snapshotForJson } = await import('@/lib/services/workspace-backup')
+        const outcome = await requestBackup(projectId)
+        if (outcome.kind === 'queued') {
+          return {
+            success: true,
+            message: `Snapshot queued in ${outcome.region}, where this project's data is kept. It runs within a few minutes; list the backups to see it.`,
+            data: { queued: true, jobId: outcome.jobId, region: outcome.region },
+          }
+        }
+        const result = outcome.result
         if (!result.success) return { success: false, message: `Backup failed: ${result.error}` }
         return {
           success: true,
@@ -3756,8 +3792,18 @@ async function executeSingleAction(
       }
 
       case 'RESTORE_DATABASE': {
-        const { restoreWorkspace } = await import('@/lib/services/workspace-backup')
-        const result = await restoreWorkspace(projectId, action.params.backupId)
+        // Restored where the project's data is kept, as a queued job when that
+        // is another region (lib/services/workspace-backup.ts).
+        const { requestRestore } = await import('@/lib/services/workspace-backup')
+        const outcome = await requestRestore(projectId, action.params.backupId)
+        if (outcome.kind === 'queued') {
+          return {
+            success: true,
+            message: `Restore queued in ${outcome.region}, where this project's data is kept. It has not run yet: it runs once, within a few minutes. Read the project's state after it has, before changing anything.`,
+            data: { queued: true, jobId: outcome.jobId, region: outcome.region },
+          }
+        }
+        const result = outcome.result
         if (!result.success) return { success: false, message: `Restore failed: ${result.error}` }
         return {
           success: true,
@@ -10313,11 +10359,17 @@ async function executeRevokeKey(params: any, projectId: string): Promise<Executi
     if (!key) return { success: false, message: `API key "${keyId}" not found` }
 
     await prisma.apiKey.delete({ where: { id: keyId } })
+    const { confirmPropagation, propagationSentence } = await import('@/lib/auth-projection/confirm')
+    const propagation = await confirmPropagation({ entity: 'api_key', entityId: keyId })
+    const where = propagationSentence(propagation)
 
     return {
       success: true,
-      message: `✅ API key \`${key.keyPrefix}...\` (${key.name}) revoked. It can no longer be used.`,
-      data: { revoked: true, keyId },
+      message:
+        propagation.status === 'pending'
+          ? `API key \`${key.keyPrefix}...\` (${key.name}) revoked at home. ${where}`
+          : `✅ API key \`${key.keyPrefix}...\` (${key.name}) revoked. It can no longer be used.${where ? ` ${where}` : ''}`,
+      data: { revoked: true, keyId, propagation },
     }
   } catch (error: any) {
     return { success: false, message: `Failed to revoke key: ${error.message}`, error: error.message }
@@ -10353,11 +10405,20 @@ async function executeRotateKey(params: any, projectId: string): Promise<Executi
       // one was not on the list. See lib/auth/api-key-plaintext.ts.
       data: { key: plaintextForStorage(), keyPrefix: newPrefix, keyHash: newHash },
     })
+    // The old secret stops working in the project's region once the region has
+    // the rotation (lib/auth-projection/confirm.ts).
+    const { confirmPropagation, propagationSentence } = await import('@/lib/auth-projection/confirm')
+    const propagation = await confirmPropagation({ entity: 'api_key', entityId: keyId })
+    const where = propagationSentence(propagation)
+    const oldKey =
+      propagation.status === 'pending'
+        ? `The old key is invalid at home. ${where}`
+        : `Old key is now invalid.${where ? ` ${where}` : ''}`
 
     return {
       success: true,
-      message: `✅ **API key rotated.**\n\n**New key (copy now — shown once):**\n\`\`\`\n${newKeyValue}\n\`\`\`\n\nOld key is now invalid.`,
-      data: { rotated: true, keyId, newKey: newKeyValue },
+      message: `✅ **API key rotated.**\n\n**New key (copy now — shown once):**\n\`\`\`\n${newKeyValue}\n\`\`\`\n\n${oldKey}`,
+      data: { rotated: true, keyId, newKey: newKeyValue, propagation },
     }
   } catch (error: any) {
     return { success: false, message: `Failed to rotate key: ${error.message}`, error: error.message }
@@ -10423,11 +10484,16 @@ async function executeSetKeyPermissions(params: any, projectId: string): Promise
 
     const before = key.permissions
     await prisma.apiKey.update({ where: { id: keyId }, data: { permissions } })
+    // A narrowed key keeps its old reach in its project's region until the
+    // region has the change (lib/auth-projection/confirm.ts).
+    const { confirmPropagation, propagationSentence } = await import('@/lib/auth-projection/confirm')
+    const propagation = await confirmPropagation({ entity: 'api_key', entityId: keyId })
+    const where = propagationSentence(propagation)
 
     return {
       success: true,
-      message: `✅ API key \`${key.keyPrefix}...\` permissions updated: ${before.join(', ') || '(none)'} → ${permissions.join(', ')}`,
-      data: { keyId, permissions, previousPermissions: before },
+      message: `✅ API key \`${key.keyPrefix}...\` permissions updated: ${before.join(', ') || '(none)'} → ${permissions.join(', ')}${where ? ` ${where}` : ''}`,
+      data: { keyId, permissions, previousPermissions: before, propagation },
     }
   } catch (error: any) {
     return { success: false, message: `Failed to set permissions: ${error.message}`, error: error.message }
@@ -10468,16 +10534,23 @@ async function executeListFiles(params: any, projectId: string): Promise<Executi
       }
     }
 
-    const files = await prisma.storageFile.findMany({
+    // A regional project's names are kept in its region, so they are searched
+    // there and read back from there (lib/storage/file-names.ts).
+    const { fileIdsNamed, withFileNames } = await import('@/lib/storage/file-names')
+    const term = prefix || search
+    const namedIds = term ? await fileIdsNamed(projectId, term, prefix ? 'starts' : 'contains') : null
+    const rows = await prisma.storageFile.findMany({
       where: {
         projectId,
         ...(bucket ? { bucketId: bucket.id } : {}),
         deletedAt: null,
-        ...(prefix
-          ? { name: { startsWith: prefix } }
-          : search
-            ? { name: { contains: search, mode: 'insensitive' } }
-            : {}),
+        ...(namedIds
+          ? { id: { in: namedIds } }
+          : prefix
+            ? { name: { startsWith: prefix } }
+            : search
+              ? { name: { contains: search, mode: 'insensitive' } }
+              : {}),
       },
       take: limit,
       orderBy: { createdAt: 'desc' },
@@ -10491,6 +10564,7 @@ async function executeListFiles(params: any, projectId: string): Promise<Executi
         bucket: { select: { name: true } },
       },
     })
+    const files = await withFileNames(projectId, rows)
 
     if (files.length === 0) {
       return {
@@ -10550,12 +10624,16 @@ async function resolveStorageFile(
     bucket: { select: { name: true, accessPolicy: true } },
   } as const
 
+  // A regional project's rows hold a stand-in for each name: a name is found
+  // by its stand-in, and the file is handed back with its real name.
+  const { storedFileName, withFileName } = await import('@/lib/storage/file-names')
+
   if (fileId) {
     const file = await prisma.storageFile.findFirst({
       where: { id: fileId, projectId, deletedAt: null },
       select: fileSelect,
     })
-    return file ? { file } : { error: `No file with id "${fileId}" in this project.` }
+    return file ? { file: await withFileName(projectId, file) } : { error: `No file with id "${fileId}" in this project.` }
   }
 
   if (!fileName) {
@@ -10575,12 +10653,12 @@ async function resolveStorageFile(
   }
 
   const file = await prisma.storageFile.findFirst({
-    where: { projectId, name: fileName, deletedAt: null, ...(bucketId ? { bucketId } : {}) },
+    where: { projectId, name: await storedFileName(projectId, fileName), deletedAt: null, ...(bucketId ? { bucketId } : {}) },
     select: fileSelect,
     orderBy: { createdAt: 'desc' },
   })
   return file
-    ? { file }
+    ? { file: await withFileName(projectId, file) }
     : {
         error: `File "${fileName}"${bucketName ? ` in bucket "${bucketName}"` : ''} not found. Run LIST_FILES first.`,
       }
@@ -10982,12 +11060,16 @@ async function executeFixAiFunction(params: any, projectId: string): Promise<Exe
       ? await prisma.aiFunction.findFirst({ where: { name: functionName, projectId } })
       : null
 
+    // A regional project's last errors are read from its region
+    // (lib/services/ai-functions/run-records.ts).
+    const { withLastErrors } = await import('@/lib/services/ai-functions/run-records')
+
     if (!fn) {
       // No specific function identified — list broken ones so the AI can pick
-      const broken = await prisma.aiFunction.findMany({
+      const broken = await withLastErrors(projectId, await prisma.aiFunction.findMany({
         where: { projectId, status: 'error' },
         select: { id: true, name: true, lastError: true },
-      })
+      }))
       if (broken.length === 0) {
         return { success: true, message: 'No functions are currently in an error state.' }
       }
@@ -10998,7 +11080,8 @@ async function executeFixAiFunction(params: any, projectId: string): Promise<Exe
       }
     }
 
-    const originalError = errorMessage || fn.lastError || 'unknown error'
+    const [withError] = await withLastErrors(projectId, [fn])
+    const originalError = errorMessage || withError.lastError || 'unknown error'
 
     const { generateFixedFunctionCode } = await import('@/lib/services/ai-functions/generator')
     const fixedCode = await generateFixedFunctionCode(
@@ -11027,6 +11110,12 @@ async function executeFixAiFunction(params: any, projectId: string): Promise<Exe
         lastError: syntaxCheck.valid ? null : `Syntax error: ${syntaxCheck.error}`,
       },
     })
+    // The runtime error the fix answered is no longer the last one, in the
+    // project's region either (a syntax error names the code, not the data).
+    if (fn.lastError !== null) {
+      const { rowLastError } = await import('@/lib/services/ai-functions/run-records')
+      await rowLastError(projectId, fn.id, null)
+    }
 
     if (!syntaxCheck.valid) {
       return {
@@ -11071,14 +11160,17 @@ async function executeListAiFunctions(projectId: string): Promise<ExecutionResul
     // `lastError` matters as much as the code: it is the difference between
     // "this function is wrong" and "this function is fine and the table it reads
     // has an RLS policy that matches nothing".
-    const functions = await prisma.aiFunction.findMany({
+    // A regional project's last errors and run logs are read from its region
+    // (lib/services/ai-functions/run-records.ts).
+    const { withLastErrors, withRunBodies } = await import('@/lib/services/ai-functions/run-records')
+    const functions = await withLastErrors(projectId, await prisma.aiFunction.findMany({
       where: { projectId },
       orderBy: { createdAt: 'desc' },
       select: {
         id: true, name: true, description: true, triggerType: true, triggerTable: true,
         status: true, runCount: true, lastRun: true, lastError: true, generatedCode: true,
       },
-    })
+    }))
 
     if (functions.length === 0) {
       return {
@@ -11096,8 +11188,8 @@ async function executeListAiFunctions(projectId: string): Promise<ExecutionResul
       where: { functionId: { in: functions.map(f => f.id) } },
       orderBy: { createdAt: 'desc' },
       take: 60,
-      select: { functionId: true, success: true, error: true, logs: true, createdAt: true, durationMs: true },
-    }).catch(() => [] as any[])
+      select: { id: true, functionId: true, success: true, error: true, logs: true, createdAt: true, durationMs: true },
+    }).then((runs) => withRunBodies(projectId, runs)).catch(() => [] as any[])
 
     const logsByFn = new Map<string, any[]>()
     for (const log of recentLogs) {

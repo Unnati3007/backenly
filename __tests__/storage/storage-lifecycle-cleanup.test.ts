@@ -28,12 +28,15 @@
  *     enough (this is the honest version of "incomplete upload"); a FRESH row
  *     (object still uploading) → kept
  *   - dryRun touches nothing
+ *   - each region's sweep judges only its own projects' rows against its own
+ *     bucket: another region's files are not in it, so their rows would all
+ *     read as phantoms, and their expired rows are that region's to delete
  */
 
 import { randomUUID } from 'crypto'
 import type { S3Client } from '@aws-sdk/client-s3'
 import { prisma } from '@/lib/db/prisma'
-import { runLifecycleCleanup } from '@/lib/storage/storage-lifecycle'
+import { runLifecycleCleanup, storagePurgeMode, sweepRegionStorage } from '@/lib/storage/storage-lifecycle'
 
 const DB_URL = process.env.TEST_DATABASE_URL
 
@@ -98,14 +101,14 @@ const DAY = 24 * HOUR
 const createdUserIds: string[] = []
 const createdProjectIds: string[] = []
 
-async function fixtureProject() {
+async function fixtureProject(region: string | null = null) {
   const u = await prisma.user.create({
     data: { email: `lc-${randomUUID()}@test.invalid`, name: 'Lifecycle Test' },
     select: { id: true },
   })
   createdUserIds.push(u.id)
   const p = await prisma.project.create({
-    data: { name: `lc-${randomUUID().slice(0, 8)}`, userId: u.id },
+    data: { name: `lc-${randomUUID().slice(0, 8)}`, userId: u.id, region },
     select: { id: true },
   })
   createdProjectIds.push(p.id)
@@ -246,6 +249,117 @@ describe('runLifecycleCleanup', () => {
     expect(await rowById(row.id)).not.toBeNull()
     expect(s3.objects.has(key)).toBe(true)
     expect(s3.objects.has(orphan)).toBe(true)
+    expect(s3.deleted).toHaveLength(0)
+  })
+})
+
+describe("each region's sweep covers its own bucket and its own projects", () => {
+  it("leaves another region's live files alone, though none of their objects is in this bucket", async () => {
+    const f = await fixtureProject('us-east-1')
+    const homeBucket = new FakeS3()
+    const live = await fileRow({ ...f, path: `${f.projectId}/live-${randomUUID()}.png`, ageMs: 2 * DAY })
+
+    await runLifecycleCleanup(homeBucket.asClient(), 'home-bucket', {})
+
+    // Its object is in Virginia's bucket. Missing from this one is not a phantom.
+    expect((await rowById(live.id))?.deletedAt).toBeNull()
+  })
+
+  it("leaves another region's expired files to that region's own sweep", async () => {
+    const f = await fixtureProject('us-east-1')
+    const homeBucket = new FakeS3()
+    const expired = await fileRow({ ...f, path: `${f.projectId}/expired-${randomUUID()}.png`, ageMs: 10 * DAY, deletedAgoMs: 8 * DAY })
+
+    await runLifecycleCleanup(homeBucket.asClient(), 'home-bucket', {})
+
+    // Deleting the row here would strand its object in Virginia's bucket with
+    // nothing left pointing at it.
+    expect(await rowById(expired.id)).not.toBeNull()
+    expect(homeBucket.deleted).not.toContain(expired.path)
+  })
+
+  it("cleans a region's own files in its own bucket, and judges no other region's", async () => {
+    const virginia = await fixtureProject('us-east-1')
+    const home = await fixtureProject()
+    const bucket = new FakeS3()
+    const expiredKey = `${virginia.projectId}/expired-${randomUUID()}.png`
+    const expired = await fileRow({ ...virginia, path: expiredKey, ageMs: 10 * DAY, deletedAgoMs: 8 * DAY })
+    bucket.put(expiredKey, 10 * DAY)
+    const phantom = await fileRow({ ...virginia, path: `${virginia.projectId}/never-${randomUUID()}.bin`, ageMs: 2 * HOUR })
+    const homeLive = await fileRow({ ...home, path: `${home.projectId}/live-${randomUUID()}.png`, ageMs: 2 * DAY })
+
+    await runLifecycleCleanup(bucket.asClient(), 'virginia-bucket', { region: 'us-east-1' })
+
+    expect(await rowById(expired.id)).toBeNull()
+    expect(bucket.objects.has(expiredKey)).toBe(false)
+    expect((await rowById(phantom.id))?.deletedAt).not.toBeNull()
+    // A home project's object is in the home bucket; its absence here proves nothing.
+    expect((await rowById(homeLive.id))?.deletedAt).toBeNull()
+  })
+
+  it('judges a project recording a region this build does not know against no bucket', async () => {
+    const f = await fixtureProject('xx-nowhere-1')
+    try {
+      const row = await fileRow({ ...f, path: `${f.projectId}/live-${randomUUID()}.png`, ageMs: 2 * DAY })
+
+      await runLifecycleCleanup(new FakeS3().asClient(), 'home-bucket', {})
+      await runLifecycleCleanup(new FakeS3().asClient(), 'virginia-bucket', { region: 'us-east-1' })
+
+      expect((await rowById(row.id))?.deletedAt).toBeNull()
+    } finally {
+      // Not left for the other suites' fleet passes to find.
+      await prisma.storageFile.deleteMany({ where: { projectId: f.projectId } })
+      await prisma.storageBucket.deleteMany({ where: { projectId: f.projectId } })
+      await prisma.project.delete({ where: { id: f.projectId } })
+    }
+  })
+})
+
+describe('the daily sweep', () => {
+  it('runs in dry-run unless BACKENLY_STORAGE_PURGE says enforce, and never enforces by default', () => {
+    expect(storagePurgeMode(undefined)).toBe('dry-run')
+    expect(storagePurgeMode('')).toBe('dry-run')
+    expect(storagePurgeMode('yes')).toBe('dry-run')
+    expect(storagePurgeMode(' Enforce ')).toBe('enforce')
+    expect(storagePurgeMode('off')).toBe('off')
+  })
+
+  it('reports in dry-run what it would delete, and deletes nothing', async () => {
+    const f = await fixtureProject()
+    const s3 = new FakeS3()
+    const key = `${f.projectId}/expired-${randomUUID()}.png`
+    const row = await fileRow({ ...f, path: key, ageMs: 10 * DAY, deletedAgoMs: 8 * DAY })
+    s3.put(key, 10 * DAY)
+
+    const result = await sweepRegionStorage('ap-south-1', { mode: 'dry-run', location: { client: s3.asClient(), bucket: 'home-bucket' } })
+
+    expect(result?.deletedSoftDeletes).toBeGreaterThanOrEqual(1)
+    expect(await rowById(row.id)).not.toBeNull()
+    expect(s3.deleted).toHaveLength(0)
+  })
+
+  it('deletes in enforce a file deleted past the restore window, and keeps one inside it', async () => {
+    const f = await fixtureProject()
+    const s3 = new FakeS3()
+    const expired = `${f.projectId}/expired-${randomUUID()}.png`
+    const restorable = `${f.projectId}/restorable-${randomUUID()}.png`
+    const gone = await fileRow({ ...f, path: expired, ageMs: 10 * DAY, deletedAgoMs: 8 * DAY })
+    const kept = await fileRow({ ...f, path: restorable, ageMs: 10 * DAY, deletedAgoMs: 6 * DAY })
+    s3.put(expired, 10 * DAY)
+    s3.put(restorable, 10 * DAY)
+
+    await sweepRegionStorage('ap-south-1', { mode: 'enforce', location: { client: s3.asClient(), bucket: 'home-bucket' } })
+
+    expect(await rowById(gone.id)).toBeNull()
+    expect(s3.objects.has(expired)).toBe(false)
+    expect(await rowById(kept.id)).not.toBeNull()
+    expect(s3.objects.has(restorable)).toBe(true)
+  })
+
+  it('does nothing when off', async () => {
+    const s3 = new FakeS3()
+    s3.put(`orphan-${randomUUID()}.bin`, 10 * DAY)
+    expect(await sweepRegionStorage('ap-south-1', { mode: 'off', location: { client: s3.asClient(), bucket: 'home-bucket' } })).toBeNull()
     expect(s3.deleted).toHaveLength(0)
   })
 })

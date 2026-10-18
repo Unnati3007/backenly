@@ -18,6 +18,7 @@
 
 import { prisma } from '@/lib/db/prisma'
 import type { ErrorTaxonomyCode } from '@/lib/errors/taxonomy'
+import { NOT_QUOTED, argumentShape, quotesKeptHere } from '@/lib/data-plane/residency'
 import type { RetryAttemptRecord } from './retry-wrapper'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -56,6 +57,10 @@ function isLocalId(id: string) {
  * Open a pending timeline entry at the start of an action.
  * Returns an opaque entry ID used to close the entry later.
  *
+ * A project kept in another region gets its arguments' shape only: names,
+ * structure, ids and counts, never the values, which can be its rows
+ * (lib/data-plane/residency.ts).
+ *
  * Never throws — returns a local fallback ID on DB failure.
  */
 export async function openTimelineEntry(
@@ -66,13 +71,14 @@ export async function openTimelineEntry(
   userId?: string,
 ): Promise<string> {
   try {
+    const quote = await quotesKeptHere(projectId)
     const entry = await (prisma as any).executionTimelineEntry.create({
       data: {
         projectId,
         userId:      userId ?? null,
         executionId,
         actionType,
-        actionParams,
+        actionParams: quote ? actionParams : argumentShape(actionParams),
         startedAt:    new Date(),
         status:       'pending',
         retryCount:   0,
@@ -245,6 +251,14 @@ export async function trackAction<T extends { success: boolean; message?: string
     opts?.userId,
   )
 
+  // A project kept in another region: no message text, whose values can be
+  // its rows, here or in the retry history (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(projectId)
+  const message = (text: string | undefined) => (quote || !text ? text : NOT_QUOTED)
+  const retryHistory = quote
+    ? opts?.retryHistory
+    : opts?.retryHistory?.map(attempt => ({ ...attempt, errorMessage: message(attempt.errorMessage) ?? '' }))
+
   const startMs = Date.now()
   let result: T
 
@@ -259,8 +273,8 @@ export async function trackAction<T extends { success: boolean; message?: string
       retryCount:          opts?.retryCount ?? 0,
       selfCorrected:       opts?.selfCorrected ?? false,
       errorClassification: opts?.errorClassification,
-      errorMessage:        err?.message,
-      retryHistory:        opts?.retryHistory,
+      errorMessage:        message(err?.message),
+      retryHistory,
     }).catch(() => {})
     throw err
   }
@@ -280,8 +294,8 @@ export async function trackAction<T extends { success: boolean; message?: string
     retryCount:          opts?.retryCount ?? 0,
     selfCorrected:       opts?.selfCorrected ?? false,
     errorClassification: opts?.errorClassification,
-    errorMessage:        result.error ?? result.message,
-    retryHistory:        opts?.retryHistory,
+    errorMessage:        message(result.error ?? result.message),
+    retryHistory,
   }).catch(() => {})
 
   return result

@@ -4,9 +4,11 @@ import { NextRequest } from 'next/server'
 import { v1ApiMiddleware, requirePermission, requireCapability } from '@/lib/api/v1/middleware'
 import { createErrorResponse, createSuccessResponse, handleValidationError, ErrorCodes, regionErrorResponse } from '@/lib/api/v1/errors'
 import { deleteSchema } from '@/lib/api/v1/schemas'
+import { typedParams } from '@/lib/api/v1/typed-params'
 import { validateRequestBody } from '@/lib/validation/schemas'
 import { prisma } from '@/lib/db'
 import { workspaceRawClient } from '@/lib/data-plane/regional'
+import { columnTypes } from '@/lib/mcp/runtime-db'
 import { executeWithUserContext } from '@/lib/services/workspace-rls'
 import { recordedV1 } from '@/lib/traffic/recorded-v1'
 
@@ -50,16 +52,15 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
       return createErrorResponse(ErrorCodes.NOT_FOUND, `Table '${table}' not found in this project`, 404)
     }
 
-    // Build WHERE clause (require it — no accidental full-table deletes)
+    // Build WHERE clause (require it — no accidental full-table deletes).
+    // Each value is cast to its column's type (lib/api/v1/typed-params.ts).
     const whereParts: string[] = []
-    const values: any[] = []
-    let paramIdx = 1
+    const bound = typedParams(await columnTypes(context.projectId, schemaName, tableName))
 
     if (where && typeof where === 'object') {
       for (const [col, val] of Object.entries(where)) {
         if (!/^[a-z_][a-z0-9_]*$/i.test(col)) continue
-        whereParts.push(`"${col}" = $${paramIdx++}`)
-        values.push(val)
+        whereParts.push(`"${col}" = ${bound.bind(col, val)}`)
       }
     }
 
@@ -92,7 +93,7 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
         context.endUserId ?? '',
         context.apiKey.serviceRole,
         softSql,
-        values,
+        bound.values,
         context.endUserRole ?? 'user'
       )
     } else {
@@ -102,7 +103,7 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
         context.endUserId ?? '',
         context.apiKey.serviceRole,
         hardSql,
-        values,
+        bound.values,
         context.endUserRole ?? 'user'
       )
     }

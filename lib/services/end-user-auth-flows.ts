@@ -29,6 +29,9 @@ import { ensureAuthUsersTable, introspectAuthUsersTable, stampLastLogin, isReser
 import { trackEndUserActive } from '@/lib/quota/kernel'
 import { emitEndUserCreated } from '@/lib/services/end-user-auth-events'
 import { resolveJwtSecret } from '@/lib/services/jwtSecretManager'
+// Existence and the signing secret, from the region's copy while it is fresh
+// (lib/auth-projection/read.ts): nothing else of the project is read here.
+import { authorizingProject } from '@/lib/auth-projection/read'
 import {
   mainAuthEnvironment,
   endUserTokenSecret,
@@ -68,7 +71,7 @@ export async function refreshEndUserToken(
   env: AuthEnvironment = mainAuthEnvironment(projectId),
 ): Promise<AuthFlowResult> {
   try {
-    const project = await prisma.project.findUnique({ where: { id: projectId } })
+    const project = await authorizingProject(projectId)
     if (!project) return err('NOT_FOUND', 'Project not found', 404)
 
     if (!rawToken) {
@@ -187,7 +190,7 @@ export async function logoutEndUser(
   env: AuthEnvironment = mainAuthEnvironment(projectId),
 ): Promise<AuthFlowResult> {
   try {
-    const project = await prisma.project.findUnique({ where: { id: projectId } })
+    const project = await authorizingProject(projectId)
     if (!project) return err('NOT_FOUND', 'Project not found', 404)
 
     if (rawToken) {
@@ -261,7 +264,7 @@ export async function logoutEndUser(
  */
 export async function forgotEndUserPassword(projectId: string, emailRaw: unknown): Promise<AuthFlowResult> {
   try {
-    const project = await prisma.project.findUnique({ where: { id: projectId } })
+    const project = await authorizingProject(projectId)
     if (!project) return err('NOT_FOUND', 'Project not found', 404)
 
     const email = typeof emailRaw === 'string' ? emailRaw.toLowerCase().trim() : undefined
@@ -390,7 +393,7 @@ export async function resetEndUserPassword(
   passwordRaw: unknown,
 ): Promise<AuthFlowResult> {
   try {
-    const project = await prisma.project.findUnique({ where: { id: projectId } })
+    const project = await authorizingProject(projectId)
     if (!project) return err('NOT_FOUND', 'Project not found', 404)
 
     if (!project.jwtSecret || project.jwtSecret.length < 32) {
@@ -443,7 +446,7 @@ export async function resetEndUserPassword(
       projectId,
       '',
       true,
-      `SELECT id, email, name FROM "${schemaName}"."users" WHERE email = $1 LIMIT 1`,
+      `SELECT id, email, name${usersSchema.hasIsBlocked ? ', is_blocked' : ''} FROM "${schemaName}"."users" WHERE email = $1 LIMIT 1`,
       [reset.email],
     ).catch(() => [] as any[])
 
@@ -452,11 +455,17 @@ export async function resetEndUserPassword(
     }
 
     const user = users[0]
+    // A suspended account is refused before its password changes or a session
+    // is issued, with the answer sign-in and refresh give it. The link stays
+    // unused.
+    if (user.is_blocked) return err('FORBIDDEN', 'This account has been suspended.', 403)
     const hashedPassword = await hashPassword(newPassword)
 
     // Update the user's password — service-role so the UPDATE bypasses
     // own_rows RLS that would otherwise gate the row on app.current_user_id.
-    // Column names come from the live schema descriptor, never hardcoded.
+    // Column names come from the live schema descriptor, never hardcoded, and
+    // the id is bound as the column's own type: a bare $2 arrives as text, and
+    // on a uuid `id` (the canonical shape) every reset failed with 42883.
     const setParts = [`"${usersSchema.passwordColumn}" = $1`]
     if (usersSchema.updatedAtColumn) setParts.push(`"${usersSchema.updatedAtColumn}" = NOW()`)
     await executeWithUserContext(
@@ -465,15 +474,16 @@ export async function resetEndUserPassword(
       true,
       `UPDATE "${schemaName}"."users"
          SET ${setParts.join(', ')}
-         WHERE id = $2`,
+         WHERE id = $2${userIdCast(usersSchema)}`,
       [hashedPassword, user.id],
     )
 
-    // Mark the reset token as used (single-use enforcement)
+    // Mark the reset token as used (single-use enforcement). The table's id is
+    // the uuid this file creates it with.
     await db.$executeRawUnsafe(
       `UPDATE "${schemaName}"."_password_resets"
          SET used_at = NOW()
-         WHERE id = $1`,
+         WHERE id = $1::uuid`,
       reset.id,
     )
 
@@ -573,8 +583,10 @@ async function consumeToken(
   const row = rows[0]
   if (row.used_at) return { error: 'This link has already been used.' }
   if (new Date(row.expires_at) < new Date()) return { error: 'This link has expired. Please request a new one.' }
+  // ensureTokenTable creates the id as uuid. A bare $1 arrives as text, which a
+  // uuid column refuses (42883), so no link could be consumed.
   await db.$executeRawUnsafe(
-    `UPDATE "${schemaName}"."${tableName}" SET used_at = NOW() WHERE id = $1`,
+    `UPDATE "${schemaName}"."${tableName}" SET used_at = NOW() WHERE id = $1::uuid`,
     row.id,
   )
   return { email: row.email }
@@ -587,7 +599,7 @@ async function consumeToken(
  */
 export async function requestEmailVerification(projectId: string, emailRaw: unknown): Promise<AuthFlowResult> {
   try {
-    const project = await prisma.project.findUnique({ where: { id: projectId } })
+    const project = await authorizingProject(projectId)
     if (!project) return err('NOT_FOUND', 'Project not found', 404)
 
     const email = typeof emailRaw === 'string' ? emailRaw.toLowerCase().trim() : undefined
@@ -638,7 +650,7 @@ export async function requestEmailVerification(projectId: string, emailRaw: unkn
  */
 export async function verifyEndUserEmail(projectId: string, tokenRaw: unknown): Promise<AuthFlowResult> {
   try {
-    const project = await prisma.project.findUnique({ where: { id: projectId } })
+    const project = await authorizingProject(projectId)
     if (!project) return err('NOT_FOUND', 'Project not found', 404)
 
     const token = typeof tokenRaw === 'string' ? tokenRaw.trim() : undefined
@@ -674,7 +686,7 @@ export async function verifyEndUserEmail(projectId: string, tokenRaw: unknown): 
  */
 export async function requestMagicLink(projectId: string, emailRaw: unknown): Promise<AuthFlowResult> {
   try {
-    const project = await prisma.project.findUnique({ where: { id: projectId } })
+    const project = await authorizingProject(projectId)
     if (!project) return err('NOT_FOUND', 'Project not found', 404)
     if (!project.jwtSecret || project.jwtSecret.length < 32) {
       return err('INTERNAL_ERROR', 'Authentication is not configured for this project.', 503)
@@ -726,7 +738,7 @@ export async function requestMagicLink(projectId: string, emailRaw: unknown): Pr
  */
 export async function verifyMagicLink(projectId: string, tokenRaw: unknown): Promise<AuthFlowResult> {
   try {
-    const project = await prisma.project.findUnique({ where: { id: projectId } })
+    const project = await authorizingProject(projectId)
     if (!project) return err('NOT_FOUND', 'Project not found', 404)
     if (!project.jwtSecret || project.jwtSecret.length < 32) {
       return err('INTERNAL_ERROR', 'Authentication is not configured for this project.', 503)
@@ -749,9 +761,13 @@ export async function verifyMagicLink(projectId: string, tokenRaw: unknown): Pro
     let users = await executeWithUserContext<any>(
       projectId,
       '', true,
-      `SELECT id, email${usersSchema.hasName ? ', name' : ''}${usersSchema.hasRole ? ', role' : ''} FROM "${schemaName}"."users" WHERE email = $1 LIMIT 1`,
+      `SELECT id, email${usersSchema.hasName ? ', name' : ''}${usersSchema.hasRole ? ', role' : ''}${usersSchema.hasIsBlocked ? ', is_blocked' : ''} FROM "${schemaName}"."users" WHERE email = $1 LIMIT 1`,
       [email],
     ).catch(() => [] as any[])
+
+    // A suspended account is refused before it is verified or signed in, with
+    // the answer sign-in and refresh give it.
+    if (users[0]?.is_blocked) return err('FORBIDDEN', 'This account has been suspended.', 403)
 
     if (users.length === 0) {
       // First sign-in: create the account with an unguessable password hash.

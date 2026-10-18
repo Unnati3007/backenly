@@ -56,6 +56,7 @@
 import { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db/prisma'
 import { projectRegion, regionOfRecord, regionRawClient } from '@/lib/data-plane/regional'
+import { serviceRegion } from '@/lib/data-plane/serving'
 import { HOME_REGION, type CloudRegionId } from '@/lib/regions'
 import {
   assertValidProjectId,
@@ -68,6 +69,7 @@ import { functionRoleName } from '@/lib/services/ai-functions/function-db-role'
 import { purgeProjectExternals } from '@/lib/projects/purge'
 import { PURGE_JOB_TYPE, PURGE_STATUS } from '@/lib/queue'
 import { purgeAccountState } from '@/lib/usage/account'
+import { confirmPropagation, type Propagation } from '@/lib/auth-projection/confirm'
 
 export { PURGE_JOB_TYPE, PURGE_STATUS }
 
@@ -113,6 +115,12 @@ export interface DeletionResult {
   purgeJobIds: string[]
   /** False when the post-commit purge attempt failed and was left to the worker. */
   externalPurgeCompleted: boolean
+  /**
+   * Whether the project's region has the deletion yet, for a single project
+   * kept outside the home region (lib/auth-projection/confirm.ts). Unset for an
+   * account deletion, whose projects' deletions are delivered all the same.
+   */
+  propagation?: Propagation
 }
 
 type Tx = Prisma.TransactionClient
@@ -183,6 +191,14 @@ const SWEEP_EXCLUDED: Record<string, string> = {
   UsageMetric: 'billing ledger',
   // Platform telemetry about Backenly itself, not customer content.
   ProductEvent: 'platform telemetry',
+  // The deletion itself, on its way to the project's region. The delete
+  // trigger records it in this same transaction, and the region removes the
+  // project and its keys from its authorization copy only when this row is
+  // delivered (lib/auth-projection/deliver.ts). Swept here, the region would
+  // never hear of the deletion while its copy stayed fresh, and the deleted
+  // project's keys would keep working there. Delivered rows are pruned a day
+  // later; they hold ids only.
+  AuthProjectionChange: 'carries the deletion to its region',
 }
 
 /** Exported for the deletion test, which seeds and sweeps this exact list. */
@@ -306,6 +322,12 @@ async function dropRegionalProjectData(projectId: string, region: CloudRegionId)
       for (const schema of schemas) {
         await rtx.$executeRawUnsafe(`DROP SCHEMA IF EXISTS ${quoteIdent(schema)} CASCADE`)
       }
+      // The project's customer data kept off its platform rows
+      // (lib/data-plane/regional-bodies.ts) goes with it, not 30 days later.
+      // A database the procedure has not given the table yet holds none.
+      const [{ present }] = await rtx.$queryRaw<{ present: boolean }[]>`
+        SELECT to_regclass('public.regional_bodies') IS NOT NULL AS present`
+      if (present) await rtx.$executeRaw`DELETE FROM public.regional_bodies WHERE "projectId" = ${projectId}`
       // After the schemas, so the roles hold no grants that would block the drop.
       await dropRoles(rtx, projectRoleNames(credentialRoles, schemas))
       return schemas
@@ -385,14 +407,22 @@ async function purgeProjectInTransaction(
  * on disk.
  */
 async function attemptImmediatePurge(
-  targets: { projectId: string; jobId: string }[],
+  targets: { projectId: string; jobId: string; region: CloudRegionId }[],
 ): Promise<boolean> {
   let allSucceeded = true
 
-  for (const { projectId, jobId } of targets) {
+  for (const { projectId, jobId, region } of targets) {
+    // A project kept in another region is purged there, by that region's
+    // scheduler (lib/queue/worker.ts processPurgeJobs): its bucket and disks
+    // are not this process's. The job stays pending until it does.
+    if (region !== serviceRegion()) {
+      allSucceeded = false
+      continue
+    }
     try {
       const report = await purgeProjectExternals(projectId, {
         storageDriver: process.env.STORAGE_DRIVER || 'local',
+        region,
       })
 
       await prisma.backgroundJob
@@ -470,13 +500,17 @@ export async function deleteProjectCompletely(projectId: string): Promise<Deleti
     `[ProjectDelete] project=${projectId} schemas=${schemas.length} purgeJob=${jobId}`,
   )
 
-  const externalPurgeCompleted = await attemptImmediatePurge([{ projectId, jobId }])
+  const externalPurgeCompleted = await attemptImmediatePurge([{ projectId, jobId, region }])
+  // Its keys stop working in its region once the region has the deletion
+  // (lib/auth-projection/confirm.ts); `pending` says it is still in flight.
+  const propagation = await confirmPropagation({ entity: 'project', entityId: projectId })
 
   return {
     projectIds: [projectId],
     schemasDropped: schemas,
     purgeJobIds: [jobId],
     externalPurgeCompleted,
+    propagation,
   }
 }
 
@@ -571,7 +605,7 @@ export async function deleteAccountCompletely(userId: string): Promise<DeletionR
   )
 
   const externalPurgeCompleted = await attemptImmediatePurge(
-    projectIds.map((projectId, i) => ({ projectId, jobId: jobIds[i] })),
+    projectIds.map((projectId, i) => ({ projectId, jobId: jobIds[i], region: regions.get(projectId) ?? HOME_REGION })),
   )
 
   return {

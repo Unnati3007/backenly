@@ -30,6 +30,9 @@ packages/*/*.tsbuildinfo
 # private keys live.
 !docker/certs/rds-ca-ap-south-1.pem
 !docker/certs/rds-ca-us-east-1.pem
+!docker/certs/rds-ca-us-west-2.pem
+!docker/certs/rds-ca-eu-central-1.pem
+!docker/certs/rds-ca-ap-southeast-1.pem
 
 # debug
 npm-debug.log*

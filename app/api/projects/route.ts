@@ -130,8 +130,9 @@ export const POST = withAuth(async (request: NextRequest, { user }) => {
     // A region that does not exist or is not open yet is refused, never
     // swapped for another: the caller would get a project somewhere it did not
     // ask for. The project is then created in the region it asked for (see
-    // lib/regions.ts for what opening a region involves).
-    const regionCheck = checkRequestedRegion(validatedData.region)
+    // lib/regions.ts for what opening a region involves, and for the preview
+    // list that lets named users create in a region being qualified).
+    const regionCheck = checkRequestedRegion(validatedData.region, process.env, user.userId)
     if (regionCheck.ok === false) {
       return NextResponse.json(
         { success: false, error: regionCheck.message, code: regionCheck.code },

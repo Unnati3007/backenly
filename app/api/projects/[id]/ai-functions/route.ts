@@ -4,6 +4,7 @@ import { authenticateRequest } from '@/lib/auth/middleware'
 import { generateFunctionCode } from '@/lib/services/ai-functions/generator'
 import { validateAiFunctionData } from '@/lib/ai/function-validation'
 import { canAccessProject, canWriteProject } from '@/lib/edition/guard'
+import { rowLastError, withLastErrors } from '@/lib/services/ai-functions/run-records'
 
 /**
  * GET /api/projects/[id]/ai-functions
@@ -17,10 +18,11 @@ export async function GET(request: NextRequest, props: { params: Promise<{ id: s
 
     if (!(await canAccessProject(auth.userId, params.id))) return NextResponse.json({ error: 'Project not found' }, { status: 404 })
 
-    const raw = await prisma.aiFunction.findMany({
+    // A regional project's last errors are read from its region.
+    const raw = await withLastErrors(params.id, await prisma.aiFunction.findMany({
       where: { projectId: params.id },
       orderBy: { createdAt: 'desc' },
-    })
+    }))
 
     // ── 1. Filter out phantom/placeholder functions ───────────────────────────
     // These were created before creation-time guards were in place. They have
@@ -83,12 +85,13 @@ export async function GET(request: NextRequest, props: { params: Promise<{ id: s
     if (toHeal.length > 0) {
       // Fire-and-forget — never blocks the response
       Promise.allSettled(
-        toHeal.map(fn =>
-          prisma.aiFunction.update({
+        toHeal.map(async fn => {
+          await prisma.aiFunction.update({
             where: { id: fn.id },
             data: { status: 'active', lastError: null },
           })
-        )
+          await rowLastError(params.id, fn.id, null)
+        })
       ).catch(() => {})
 
       // Return healed state immediately (don't make caller wait for DB)

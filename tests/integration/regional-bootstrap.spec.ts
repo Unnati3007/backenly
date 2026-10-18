@@ -60,7 +60,7 @@ jest.setTimeout(300_000)
 const ROOT = process.cwd()
 const DB = 'backenly_regional'
 const ADMIN = 'regional_admin'
-const STEPS = ['roles', 'postgrest', 'drift-events', 'direct-access', 'extensions']
+const STEPS = ['roles', 'postgrest', 'drift-events', 'regional-bodies', 'auth-projection', 'direct-access', 'extensions']
 const LOGINS = ['backenly_app', 'backenly_backup', 'backenly_authenticator'] as const
 type Login = (typeof LOGINS)[number]
 const VERIFIER_VARIABLE: Record<Login, string> = {
@@ -309,7 +309,7 @@ describe('a region’s first database', () => {
     expect(result.status).toBe(0)
     for (const step of STEPS) expect(result.output).toContain(`step ${step}: pending`)
     for (const role of LOGINS) expect(result.output).toContain(`credential ${role}: missing (the first apply must supply ${VERIFIER_VARIABLE[role]})`)
-    expect(result.output).toContain('Check only: nothing was written. 5 step(s) not applied yet.')
+    expect(result.output).toContain(`Check only: nothing was written. ${STEPS.length} step(s) not applied yet.`)
     expect(await rows(superUrl(), `SELECT 1 FROM pg_namespace WHERE nspname = 'backenly_meta'`)).toEqual([])
     expect(await rows(superUrl(), `SELECT rolname FROM pg_roles WHERE rolname = ANY($1)`, [[...LOGINS]])).toEqual([])
   })
@@ -462,11 +462,31 @@ describe('the application, against the database the procedure built', () => {
   it('keeps each role to its job', async () => {
     // The app reads, adopts and prunes drift events; only the capture inserts them.
     expect(await refusal(app(), `INSERT INTO public.schema_drift_events ("id", "roleName", "commandTag") VALUES ('x', 'y', 'z')`)).toMatch(/permission denied/)
+    // The app keeps the region's customer data off the platform rows; nobody else reads it.
+    expect(await refusal(app(), `INSERT INTO public.regional_bodies ("kind", "id", "projectId") VALUES ('webhook', 'x', 'p'); DELETE FROM public.regional_bodies WHERE "id" = 'x'`)).toBeNull()
+    // The app reads the region's authorization copy, and home writes it as the app.
+    expect(
+      await refusal(
+        app(),
+        `INSERT INTO public.auth_projection_projects ("id", "version") VALUES ('x', 1); DELETE FROM public.auth_projection_projects WHERE "id" = 'x'; ` +
+          `SELECT count(*) FROM public.auth_projection_keys; SELECT count(*) FROM public.auth_projection_branches; SELECT count(*) FROM public.auth_projection_state; ` +
+          `INSERT INTO public.auth_rate_windows ("keyId", "windowSeconds", "keyMark", "resetAt", "count", "lastUsedAt") VALUES ('x', 60, 'm', now(), 1, now()); ` +
+          `DELETE FROM public.auth_rate_windows WHERE "keyId" = 'x'`,
+      ),
+    ).toBeNull()
     // The backup role reads every workspace, for pg_dump.
     expect(await rows(loginUrl('backenly_backup'), `SELECT count(*)::int AS n FROM "${schema}".notes`)).toEqual([{ n: 1 }])
     // The authenticator holds nothing itself and can become only the API roles.
     const authenticator = loginUrl('backenly_authenticator')
     expect(await refusal(authenticator, `SELECT count(*) FROM public.schema_drift_events`)).toMatch(/permission denied/)
+    expect(await refusal(authenticator, `SELECT count(*) FROM public.regional_bodies`)).toMatch(/permission denied/)
+    for (const copy of ['auth_projection_state', 'auth_projection_projects', 'auth_projection_keys', 'auth_projection_branches', 'auth_rate_windows']) {
+      expect(await refusal(authenticator, `SELECT count(*) FROM public.${copy}`)).toMatch(/permission denied/)
+      // Nor any role it can become: the copy holds key hashes and signing secrets.
+      for (const apiRole of ['anon', 'authenticated', 'service_role']) {
+        expect(await refusal(authenticator, `SELECT postgrest.pre_config(); SET ROLE ${apiRole}; SELECT count(*) FROM public.${copy}`)).toMatch(/permission denied/)
+      }
+    }
     expect(await refusal(authenticator, `SET ROLE backenly_app`)).toMatch(/permission denied/)
     expect(await refusal(authenticator, `SET ROLE anon; SELECT postgrest.pre_config()`)).toMatch(/permission denied/)
     expect(await refusal(authenticator, `SELECT postgrest.pre_config(); SET ROLE anon; SET ROLE authenticated; SET ROLE service_role`)).toBeNull()

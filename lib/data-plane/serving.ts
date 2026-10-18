@@ -24,6 +24,7 @@
  */
 
 import { NextResponse } from 'next/server'
+import type { Prisma } from '@prisma/client'
 import { prisma } from '@/lib/db/prisma'
 import { isRegionError, projectApiOrigin, projectRegion } from '@/lib/data-plane/regional'
 import { HOME_REGION, findRegion, type CloudRegionId } from '@/lib/regions'
@@ -84,6 +85,17 @@ export async function partitionServed<T extends { id: string }>(
     else elsewhere.push(target)
   }
   return { served, elsewhere }
+}
+
+/**
+ * The platform-database filter for the projects whose data `region` holds:
+ * those recording it and, for the home region, those recording none, every
+ * project created before regions. A project recording a region this build
+ * does not know matches no region's filter, so a pass that acts on one
+ * region's storage, a bucket's sweep say, never judges it against another's.
+ */
+export function heldInRegionWhere(region: CloudRegionId): Prisma.ProjectWhereInput {
+  return region === HOME_REGION ? { OR: [{ region: null }, { region: HOME_REGION }] } : { region }
 }
 
 export const WRONG_REGION = 'WRONG_REGION'

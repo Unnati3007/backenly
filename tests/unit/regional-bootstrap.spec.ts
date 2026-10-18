@@ -96,7 +96,7 @@ describe('bootstrap.sh and verify.sql agree', () => {
     const steps = [...read(`${DIR}/bootstrap.sh`).matchAll(/^step ([a-z-]+) /gm)].map((m) => m[1])
     const block = section(read(`${DIR}/sql/verify.sql`), '── Every step recorded', 'IF array_length')
     const required = [...block.matchAll(/'([a-z-]+)'/g)].map((m) => m[1])
-    expect(steps).toEqual(['roles', 'postgrest', 'drift-events', 'direct-access', 'extensions'])
+    expect(steps).toEqual(['roles', 'postgrest', 'drift-events', 'regional-bodies', 'auth-projection', 'direct-access', 'extensions'])
     expect(required).toEqual(steps)
   })
 
@@ -153,6 +153,9 @@ describe('the RDS roots a regional image trusts', () => {
   // in tests/unit/rds-ca-bundle-is-pinned.spec.ts.
   const PINNED: Record<string, string> = {
     'us-east-1': 'sXEdErrlGDhYEoHiO2y5exB0AWhztNr8gO0UACRi3Xc=',
+    'us-west-2': 'cztS5LWJWGN34+APfEYlth4Uy/C14Iys4otPiuzCfGY=',
+    'eu-central-1': 'VqDK4ES2zEM5cdlkNHQBaSqS6gKU45J1Oj69ruVNi4Q=',
+    'ap-southeast-1': 'PGlgIKO3xnIQhdGCIRwoAkqwGHOt413Mfu67icIO6Xk=',
   }
 
   it.each(Object.entries(PINNED))('%s is the pinned bundle, byte for byte', (region, sha256) => {

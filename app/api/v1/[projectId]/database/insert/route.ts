@@ -4,8 +4,10 @@ import { NextRequest } from 'next/server'
 import { v1ApiMiddleware, requirePermission, requireCapability } from '@/lib/api/v1/middleware'
 import { createErrorResponse, createSuccessResponse, handleValidationError, ErrorCodes } from '@/lib/api/v1/errors'
 import { insertSchema } from '@/lib/api/v1/schemas'
+import { typedParams } from '@/lib/api/v1/typed-params'
 import { validateRequestBody } from '@/lib/validation/schemas'
 import { prisma } from '@/lib/db'
+import { columnTypes } from '@/lib/mcp/runtime-db'
 import { executeWithUserContext } from '@/lib/services/workspace-rls'
 import { validateInsertPayload } from '@/lib/services/workspace-validator'
 import { recordedV1 } from '@/lib/traffic/recorded-v1'
@@ -65,6 +67,8 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
     // Build INSERT from data object
     const rows = Array.isArray(data) ? data : [data]
     const inserted: any[] = []
+    // Each value is cast to its column's type (lib/api/v1/typed-params.ts).
+    const types = await columnTypes(context.projectId, schemaName, tableName)
 
     for (const row of rows) {
       // Validate row fields against live table schema (types, lengths, required columns)
@@ -83,8 +87,8 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
       if (cols.length === 0) continue
 
       const colList = cols.map(c => `"${c}"`).join(', ')
-      const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ')
-      const values = cols.map(c => row[c])
+      const bound = typedParams(types)
+      const placeholders = cols.map(c => bound.bind(c, row[c])).join(', ')
 
       const sql = `INSERT INTO "${schemaName}"."${tableName}" (${colList}) VALUES (${placeholders}) RETURNING *`
       const result = await executeWithUserContext(
@@ -92,7 +96,7 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
         context.endUserId ?? '',
         context.apiKey.serviceRole,
         sql,
-        values,
+        bound.values,
         context.endUserRole ?? 'user'
       )
       if (result[0]) inserted.push(result[0])

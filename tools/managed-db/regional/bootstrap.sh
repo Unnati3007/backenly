@@ -4,8 +4,10 @@
 # ================================
 # Turns an EMPTY PostgreSQL 16 database into a Backenly regional data-plane
 # database: the roles, the PostgREST support objects, the drift-event table,
-# direct database access and its DDL capture, and the extensions the
-# data plane uses. It holds no platform tables: those stay in the home region.
+# the tables for the region's own customer data and its copy of what
+# authorizes its requests, direct database access and its DDL capture, and the
+# extensions the data plane uses. It holds no platform tables: those stay in
+# the home region.
 #
 #   BOOTSTRAP_MODE=check bash tools/managed-db/regional/bootstrap.sh   # report, write nothing
 #   BOOTSTRAP_MODE=apply bash tools/managed-db/regional/bootstrap.sh   # converge
@@ -36,7 +38,8 @@
 #
 # Passwords never reach this script or the database: the operator's machine
 # computes each verifier and keeps the password only long enough to write the
-# connection string to Secrets Manager.
+# connection string to Secrets Manager. On Backenly Cloud that is launch.ts,
+# next to this file, which also runs this script as the region's one-off task.
 #
 # ── Output a launcher may read ────────────────────────────────────────────────
 #   step <id>: pending | current | changed           (check)
@@ -165,9 +168,15 @@ step postgrest "$ROOT/scripts/postgrest-install.sh|$ROOT/scripts/lib/db-admin.sh
 # 3. The one platform-shaped table a regional database holds, before the capture
 #    triggers that write it.
 step drift-events "$ROOT/scripts/sql/schema-drift-events.sql"
-# 4. Direct database access and its two DDL-capture event triggers.
+# 4. The region's projects' customer data on platform rows, which never
+#    leaves the region (lib/data-plane/regional-bodies.ts).
+step regional-bodies "$ROOT/scripts/sql/regional-bodies.sql"
+# 5. The region's copy of what authorizes its projects' requests, delivered
+#    from the home region (lib/auth-projection/deliver.ts).
+step auth-projection "$ROOT/scripts/sql/auth-projection.sql"
+# 6. Direct database access and its two DDL-capture event triggers.
 step direct-access "$ROOT/scripts/setup-direct-access.sql"
-# 5. Extensions the data plane and its probes use.
+# 7. Extensions the data plane and its probes use.
 step extensions "$HERE/sql/extensions.sql"
 
 credentials

@@ -4,9 +4,11 @@ import { NextRequest } from 'next/server'
 import { v1ApiMiddleware, requirePermission, requireCapability } from '@/lib/api/v1/middleware'
 import { createErrorResponse, createSuccessResponse, handleValidationError, ErrorCodes, regionErrorResponse } from '@/lib/api/v1/errors'
 import { querySchema, PAGINATION_DEFAULT_LIMIT, PAGINATION_MAX_LIMIT } from '@/lib/api/v1/schemas'
+import { typedParams } from '@/lib/api/v1/typed-params'
 import { validateRequestBody } from '@/lib/validation/schemas'
 import { prisma } from '@/lib/db'
 import { workspaceRawClient } from '@/lib/data-plane/regional'
+import { columnTypes } from '@/lib/mcp/runtime-db'
 import { executeWithUserContext } from '@/lib/services/workspace-rls'
 import { recordedV1 } from '@/lib/traffic/recorded-v1'
 
@@ -65,12 +67,21 @@ async function handleGET(request: NextRequest, props: { params: Promise<{ projec
     // Sanitize sort column
     let safeSort = /^[a-z_][a-z0-9_]*$/i.test(sort) ? sort : 'id'
 
+    // The catalog of the project's database, in its region. Resolved before
+    // the fail-soft catches below: an unreachable region is not "no columns".
+    const db = await workspaceRawClient(context.projectId)
+
+    // The live columns and their types; each filter value is cast to its
+    // column's type (lib/api/v1/typed-params.ts).
+    const types = await columnTypes(context.projectId, schemaName, tableName).catch(() => new Map<string, string>())
+    const columnSet = new Set(types.keys())
+    if (!columnSet.has(safeSort)) safeSort = ''
+
     // Support simple GET filters: ?status=active, ?type=video, etc.
     // Any query param not in the reserved set is treated as a column=value filter.
     const RESERVED_PARAMS = new Set(['table', 'limit', 'offset', 'page', 'sort', 'order'])
     const filterParts: string[] = []
-    const filterValues: any[] = []
-    let filterParamIdx = 1
+    const bound = typedParams(types)
     for (const [key, val] of searchParams.entries()) {
       if (RESERVED_PARAMS.has(key)) continue
       if (!/^[a-z_][a-z0-9_]*$/i.test(key)) continue
@@ -78,14 +89,9 @@ async function handleGET(request: NextRequest, props: { params: Promise<{ projec
       if (val === 'null' || val === 'NULL') {
         filterParts.push(`"${key}" IS NULL`)
       } else {
-        filterParts.push(`"${key}" = $${filterParamIdx++}`)
-        filterValues.push(val)
+        filterParts.push(`"${key}" = ${bound.bind(key, val)}`)
       }
     }
-
-    // The catalog of the project's database, in its region. Resolved before
-    // the fail-soft catches below: an unreachable region is not "no columns".
-    const db = await workspaceRawClient(context.projectId)
 
     // Auto-exclude soft-deleted rows (tables with deleted_at column)
     const hasSoftDelete = await db.$queryRawUnsafe<{ count: number }[]>(
@@ -93,14 +99,6 @@ async function handleGET(request: NextRequest, props: { params: Promise<{ projec
        WHERE table_schema = $1 AND table_name = $2 AND column_name = 'deleted_at'`,
       schemaName, tableName
     ).then(r => Number(r[0]?.count ?? 0) > 0).catch(() => false)
-
-    const liveColumns = await db.$queryRawUnsafe<{ column_name: string }[]>(
-      `SELECT column_name FROM information_schema.columns
-       WHERE table_schema = $1 AND table_name = $2`,
-      schemaName, tableName
-    ).catch(() => [] as { column_name: string }[])
-    const columnSet = new Set(liveColumns.map(c => c.column_name))
-    if (!columnSet.has(safeSort)) safeSort = ''
 
     // Only exclude deleted rows if caller hasn't explicitly filtered on deleted_at
     const callerFilteredDeletedAt = filterParts.some(p => p.includes('"deleted_at"'))
@@ -120,8 +118,7 @@ async function handleGET(request: NextRequest, props: { params: Promise<{ projec
 
     if (cursorValue && safeCursorCol) {
       const cursorOp = order === 'DESC' ? '<' : '>'
-      filterParts.push(`"${safeCursorCol}" ${cursorOp} $${filterParamIdx++}`)
-      filterValues.push(cursorValue)
+      filterParts.push(`"${safeCursorCol}" ${cursorOp} ${bound.bind(safeCursorCol, cursorValue)}`)
     }
 
     const whereClause = filterParts.length > 0 ? `WHERE ${filterParts.join(' AND ')}` : ''
@@ -133,8 +130,8 @@ async function handleGET(request: NextRequest, props: { params: Promise<{ projec
     const dataSql  = `SELECT * FROM "${schemaName}"."${tableName}" ${whereClause} ${orderByClause} LIMIT ${limit} OFFSET ${effectiveOffset}`
 
     const [countResult, rows] = await Promise.all([
-      executeWithUserContext<{ count: number }>(context.projectId, context.endUserId ?? '', context.apiKey.serviceRole, countSql, filterValues, context.endUserRole ?? 'user'),
-      executeWithUserContext<any>(context.projectId, context.endUserId ?? '', context.apiKey.serviceRole, dataSql, filterValues, context.endUserRole ?? 'user'),
+      executeWithUserContext<{ count: number }>(context.projectId, context.endUserId ?? '', context.apiKey.serviceRole, countSql, bound.values, context.endUserRole ?? 'user'),
+      executeWithUserContext<any>(context.projectId, context.endUserId ?? '', context.apiKey.serviceRole, dataSql, bound.values, context.endUserRole ?? 'user'),
     ])
 
     const total = countResult[0]?.count ?? 0
@@ -210,10 +207,10 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
       return createErrorResponse(ErrorCodes.NOT_FOUND, `Table '${table}' not found in this project`, 404)
     }
 
-    // Build WHERE clause from filter object
+    // Build WHERE clause from filter object. Each value is cast to its
+    // column's type (lib/api/v1/typed-params.ts); a `contains` pattern is not.
     const whereParts: string[] = []
-    const whereValues: any[] = []
-    let paramIdx = 1
+    const bound = typedParams(await columnTypes(context.projectId, schemaName, tableName))
 
     if (where && typeof where === 'object') {
       for (const [col, val] of Object.entries(where)) {
@@ -221,20 +218,18 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
         if (!/^[a-z_][a-z0-9_]*$/i.test(col)) continue
         if (val !== null && typeof val === 'object') {
           const op = val as any
-          if (op.gt !== undefined)  { whereParts.push(`"${col}" > $${paramIdx++}`); whereValues.push(op.gt) }
-          if (op.gte !== undefined) { whereParts.push(`"${col}" >= $${paramIdx++}`); whereValues.push(op.gte) }
-          if (op.lt !== undefined)  { whereParts.push(`"${col}" < $${paramIdx++}`); whereValues.push(op.lt) }
-          if (op.lte !== undefined) { whereParts.push(`"${col}" <= $${paramIdx++}`); whereValues.push(op.lte) }
-          if (op.not !== undefined) { whereParts.push(`"${col}" != $${paramIdx++}`); whereValues.push(op.not) }
-          if (op.contains !== undefined) { whereParts.push(`"${col}" ILIKE $${paramIdx++}`); whereValues.push(`%${op.contains}%`) }
+          if (op.gt !== undefined)  whereParts.push(`"${col}" > ${bound.bind(col, op.gt)}`)
+          if (op.gte !== undefined) whereParts.push(`"${col}" >= ${bound.bind(col, op.gte)}`)
+          if (op.lt !== undefined)  whereParts.push(`"${col}" < ${bound.bind(col, op.lt)}`)
+          if (op.lte !== undefined) whereParts.push(`"${col}" <= ${bound.bind(col, op.lte)}`)
+          if (op.not !== undefined) whereParts.push(`"${col}" != ${bound.bind(col, op.not)}`)
+          if (op.contains !== undefined) whereParts.push(`"${col}" ILIKE ${bound.raw(`%${op.contains}%`)}`)
           if (op.in !== undefined && Array.isArray(op.in)) {
-            const placeholders = op.in.map(() => `$${paramIdx++}`).join(', ')
+            const placeholders = op.in.map((v: unknown) => bound.bind(col, v)).join(', ')
             whereParts.push(`"${col}" IN (${placeholders})`)
-            whereValues.push(...op.in)
           }
         } else {
-          whereParts.push(`"${col}" = $${paramIdx++}`)
-          whereValues.push(val)
+          whereParts.push(`"${col}" = ${bound.bind(col, val)}`)
         }
       }
     }
@@ -274,8 +269,8 @@ async function handlePOST(request: NextRequest, props: { params: Promise<{ proje
     const dataSql  = `SELECT ${selectClause} FROM "${schemaName}"."${tableName}" ${whereClause} ${orderByClause} LIMIT ${Number(limit)} OFFSET ${Number(offset)}`
 
     const [countResult, rows] = await Promise.all([
-      executeWithUserContext<{ count: number }>(context.projectId, context.endUserId ?? '', context.apiKey.serviceRole, countSql, whereValues, context.endUserRole ?? 'user'),
-      executeWithUserContext<any>(context.projectId, context.endUserId ?? '', context.apiKey.serviceRole, dataSql, whereValues, context.endUserRole ?? 'user'),
+      executeWithUserContext<{ count: number }>(context.projectId, context.endUserId ?? '', context.apiKey.serviceRole, countSql, bound.values, context.endUserRole ?? 'user'),
+      executeWithUserContext<any>(context.projectId, context.endUserId ?? '', context.apiKey.serviceRole, dataSql, bound.values, context.endUserRole ?? 'user'),
     ])
 
     const total = countResult[0]?.count ?? 0

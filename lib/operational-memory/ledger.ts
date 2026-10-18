@@ -1,6 +1,7 @@
+import { randomUUID } from 'crypto'
 import { prisma } from '@/lib/db'
-import { redactSecretParams } from '@/lib/mcp/withhold-secrets'
-import { sealParams } from '@/lib/operational-memory/sealed-params'
+import { quotesKeptHere } from '@/lib/data-plane/residency'
+import { keepHeldAction, storedHeldTarget } from '@/lib/operational-memory/held-action-targets'
 import type { ExecutionChange } from '@/lib/orchestration/atomic-executor'
 import { recordPattern, resolveProjectType, patternTypeForEventType } from '@/lib/patterns/cross-project-learning'
 
@@ -190,15 +191,17 @@ export function summarizeResources(changes: ExecutionChange[]) {
   }
 }
 
-export function receiptTitleForChanges(changes: ExecutionChange[], userMessage: string): string {
+// `userMessage` is null for a project kept in another region: the receipt then
+// names what changed without quoting the request (lib/data-plane/residency.ts).
+export function receiptTitleForChanges(changes: ExecutionChange[], userMessage: string | null): string {
   const resources = summarizeResources(changes)
   if (resources.tables.length > 1) return `Created ${resources.tables.length}-table backend foundation`
   if (resources.tables.length === 1 && resources.total <= 3) return `Created ${resources.tables[0]} backend resource`
   if (resources.total > 0) return `Updated ${resources.total} backend resources`
-  return `Recorded backend requirement: ${truncate(userMessage, 80)}`
+  return userMessage === null ? 'Recorded backend requirement' : `Recorded backend requirement: ${truncate(userMessage, 80)}`
 }
 
-export function receiptSummaryForChanges(changes: ExecutionChange[], userMessage: string): string {
+export function receiptSummaryForChanges(changes: ExecutionChange[], userMessage: string | null): string {
   const resources = summarizeResources(changes)
   const parts: string[] = []
 
@@ -211,10 +214,14 @@ export function receiptSummaryForChanges(changes: ExecutionChange[], userMessage
   if (resources.deployments.length) parts.push(`${resources.deployments.length} deployment change${resources.deployments.length === 1 ? '' : 's'}`)
 
   if (parts.length === 0) {
-    return `Backenly recorded the requirement: "${truncate(userMessage, 180)}".`
+    return userMessage === null
+      ? 'Backenly recorded the requirement.'
+      : `Backenly recorded the requirement: "${truncate(userMessage, 180)}".`
   }
 
-  return `Backenly changed ${joinHuman(parts)} based on the product request: "${truncate(userMessage, 180)}".`
+  return userMessage === null
+    ? `Backenly changed ${joinHuman(parts)} based on the product request.`
+    : `Backenly changed ${joinHuman(parts)} based on the product request: "${truncate(userMessage, 180)}".`
 }
 
 function eventTypeForTool(tool: string): BackendEventType | null {
@@ -315,12 +322,15 @@ function receiptTitleForTools(tools: string[]): string {
   return `Applied ${eventful.length} backend actions`
 }
 
-function receiptSummaryForTools(tools: string[], userMessage: string, summary?: string): string {
+// `userMessage` is null for a project kept in another region, and its result
+// is then not passed either (lib/data-plane/residency.ts).
+function receiptSummaryForTools(tools: string[], userMessage: string | null, summary?: string): string {
   const eventful = tools.filter(tool => eventTypeForTool(tool))
   const phrases = toolNounPhrases(eventful)
+  const request = userMessage === null ? '' : `: "${truncate(userMessage, 180)}"`
   const base = phrases.length
-    ? `Backenly applied ${joinHuman(phrases)} based on the product request: "${truncate(userMessage, 180)}".`
-    : `Backenly recorded the product request: "${truncate(userMessage, 180)}".`
+    ? `Backenly applied ${joinHuman(phrases)} based on the product request${request}.`
+    : `Backenly recorded the product request${request}.`
 
   return summary ? `${base} Result: ${truncate(stripMarkdown(summary), 240)}` : base
 }
@@ -385,6 +395,9 @@ export async function recordBackendExecutionMemory(input: RecordExecutionMemoryI
     (risk, change) => maxRisk(risk, riskForChange(change)),
     'low',
   )
+  // A project kept in another region: what changed, never the request or the
+  // intent parsed from it, which can quote its data (lib/data-plane/residency.ts).
+  const request = (await quotesKeptHere(input.projectId)) ? input.userMessage : null
 
   const events = []
 
@@ -393,9 +406,9 @@ export async function recordBackendExecutionMemory(input: RecordExecutionMemoryI
     eventType: 'product_requirement_created',
     actorType: 'user',
     actorId: input.actorId,
-    summary: `User asked: "${truncate(input.userMessage)}"`,
+    summary: request === null ? 'User asked for a backend change.' : `User asked: "${truncate(request)}"`,
     beforeState: input.beforeState,
-    afterState: input.canonicalIntent,
+    afterState: request === null ? undefined : input.canonicalIntent,
     reason: 'Captured as the source requirement for this backend change.',
     riskLevel: 'low',
     status: 'applied',
@@ -413,7 +426,9 @@ export async function recordBackendExecutionMemory(input: RecordExecutionMemoryI
         resource: change.target,
       },
       afterState: change.details,
-      reason: `Backenly applied this because of the request: "${truncate(input.userMessage, 180)}".`,
+      reason: request === null
+        ? 'Backenly applied this because of the request.'
+        : `Backenly applied this because of the request: "${truncate(request, 180)}".`,
       riskLevel: riskForChange(change),
       status: 'applied',
     }))
@@ -422,8 +437,8 @@ export async function recordBackendExecutionMemory(input: RecordExecutionMemoryI
   const receipt = await createChangeReceipt({
     projectId: input.projectId,
     eventIds: events.map(event => event.id),
-    title: receiptTitleForChanges(input.changes, input.userMessage),
-    summary: receiptSummaryForChanges(input.changes, input.userMessage),
+    title: receiptTitleForChanges(input.changes, request),
+    summary: receiptSummaryForChanges(input.changes, request),
     resourcesChanged: {
       ...summarizeResources(input.changes),
       executionId: input.executionId,
@@ -472,6 +487,10 @@ export async function recordToolExecutionMemory(input: RecordToolExecutionMemory
     (risk, tool) => maxRisk(risk, riskForTool(tool)),
     'low',
   )
+  // A project kept in another region: which tools ran, never the request or
+  // the agent's result, which can quote its data (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(input.projectId)
+  const request = quote ? input.userMessage : null
 
   const events = []
   events.push(await createBackendEvent({
@@ -479,7 +498,7 @@ export async function recordToolExecutionMemory(input: RecordToolExecutionMemory
     eventType: 'product_requirement_created',
     actorType: 'user',
     actorId: input.actorId,
-    summary: `User asked: "${truncate(input.userMessage)}"`,
+    summary: request === null ? 'User asked for a backend change.' : `User asked: "${truncate(request)}"`,
     afterState: { tools: eventfulTools },
     reason: 'Captured as the source requirement for this backend action.',
     riskLevel: 'low',
@@ -494,7 +513,9 @@ export async function recordToolExecutionMemory(input: RecordToolExecutionMemory
       actorId: input.actorId,
       summary: summarizeTool(tool),
       afterState: { tool },
-      reason: `Backenly ran this action because of the request: "${truncate(input.userMessage, 180)}".`,
+      reason: request === null
+        ? 'Backenly ran this action because of the request.'
+        : `Backenly ran this action because of the request: "${truncate(request, 180)}".`,
       riskLevel: riskForTool(tool),
       status,
     }))
@@ -504,7 +525,7 @@ export async function recordToolExecutionMemory(input: RecordToolExecutionMemory
     projectId: input.projectId,
     eventIds: events.map(event => event.id),
     title: receiptTitleForTools(eventfulTools),
-    summary: receiptSummaryForTools(eventfulTools, input.userMessage, input.summary),
+    summary: receiptSummaryForTools(eventfulTools, request, quote ? input.summary : undefined),
     resourcesChanged: {
       tools: eventfulTools,
       total: eventfulTools.length,
@@ -609,6 +630,9 @@ export async function queuePendingActionFinding(input: QueuePendingActionInput) 
   // it instead of stacking duplicates. Without this, a user repeatedly asking
   // the AI to run a gated action (without ever confirming) would flood both
   // the Review Queue and the Memory timeline with copies of the same request.
+  // A project kept in another region keeps the target there, and its row the
+  // target's stand-in, which finds the same target again.
+  const location = await storedHeldTarget(input.projectId, input.target)
   const duplicate = await prisma.healthFinding.findFirst({
     where: {
       projectId: input.projectId,
@@ -616,7 +640,7 @@ export async function queuePendingActionFinding(input: QueuePendingActionInput) 
       status: 'pending_approval',
       AND: [
         { details: { path: ['executorAction'], equals: input.action } },
-        ...(input.target ? [{ details: { path: ['location'], equals: input.target } }] : []),
+        ...(location ? [{ details: { path: ['location'], equals: location } }] : []),
       ],
     },
     select: { id: true },
@@ -624,18 +648,36 @@ export async function queuePendingActionFinding(input: QueuePendingActionInput) 
 
   if (duplicate) return duplicate
 
+  // The target and arguments are what the approver reads and what approval
+  // replays. They are kept first, under the id the finding then takes: on the
+  // finding at home, and in the region for a project kept in another one,
+  // where the finding keeps the action, its arguments' shape and the target's
+  // stand-in (lib/operational-memory/held-action-targets.ts).
+  const id = randomUUID()
+  const held = await keepHeldAction(input.projectId, id, {
+    actionTitle: capitalize(label),
+    title,
+    target: input.target,
+    params: input.params,
+  })
+
   // Record the "proposed" event FIRST so we can stitch its id onto the finding.
   // That id is the durable link between the Review Queue (HealthFinding) and the
   // Memory timeline (BackendEvent): approving/dismissing the finding later flips
   // this exact event out of the 'proposed' state instead of leaving it stale.
+  //
+  // The timeline event is a record of work, redacted at write for a project
+  // kept in another region: the action, never its target, which can be a
+  // file's name or an end user's email (lib/data-plane/residency.ts).
+  const quote = await quotesKeptHere(input.projectId)
   let backendEventId: string | null = null
   try {
     const proposedEvent = await createBackendEvent({
       projectId: input.projectId,
       eventType: eventTypeForExecutorAction(input.action),
       actorType: 'system',
-      summary: `Held for your approval: ${title}.`,
-      afterState: { executorAction: input.action, target: input.target },
+      summary: `Held for your approval: ${quote ? title : capitalize(label)}.`,
+      afterState: quote ? { executorAction: input.action, target: input.target } : { executorAction: input.action },
       reason: `User approval required — ${input.reason}`,
       riskLevel: input.riskLevel,
       status: 'proposed',
@@ -650,23 +692,17 @@ export async function queuePendingActionFinding(input: QueuePendingActionInput) 
 
   const finding = await prisma.healthFinding.create({
     data: {
+      id,
       projectId: input.projectId,
       type: 'ai_action_pending',
       severity: input.riskLevel === 'high' ? 'critical' : 'warning',
       status: 'pending_approval',
       autoFixed: false,
       details: {
-        title,
+        ...held,
         description: input.reason,
-        location: input.target,
         source: input.source,
         executorAction: input.action,
-        // Display copy only: secret-named values are redacted because this row
-        // is served (health endpoint, trust report, Review Queue card,
-        // get_autonomy_status — read-only MCP keys included). Approval replays
-        // from the sealed copy, so nothing the agent sent is lost.
-        executorParams: redactSecretParams(input.params),
-        executorParamsSealed: sealParams((input.params ?? {}) as Record<string, unknown>),
         backendEventId,
       } as any,
     },
@@ -701,8 +737,13 @@ export async function resolvePendingActionMemory(input: {
     const details = (input.finding.details ?? {}) as Record<string, unknown>
     const backendEventId =
       typeof details.backendEventId === 'string' ? details.backendEventId : null
+    // A project kept in another region: the action, never the target its title
+    // names, as the held event names it (lib/data-plane/residency.ts).
+    const quote = await quotesKeptHere(input.projectId)
+    const action = typeof details.executorAction === 'string' ? details.executorAction : null
+    const title = typeof details.title === 'string' && details.title ? details.title : null
     const label =
-      (typeof details.title === 'string' && details.title) ||
+      (quote ? title : action && capitalize(action.replace(/_/g, ' ').toLowerCase())) ||
       input.finding.type.replace(/_/g, ' ')
 
     if (backendEventId) {

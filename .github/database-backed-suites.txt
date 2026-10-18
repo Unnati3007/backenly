@@ -143,6 +143,17 @@ __tests__/auth/workspace-oauth-authorization.test.ts
 # authorized caller reaches the route's own disk lookup.
 __tests__/auth/workspace-download-authorization.test.ts
 
+# The catalog routes (schemas, indexes, relationships) read only the named
+# project's own schemas, from its own database: a second tenant's schema,
+# real and populated beside the first, is never listed and is refused 403 when
+# named; the platform view is refused; the project's own answers are real.
+__tests__/auth/catalog-routes-own-schema.test.ts
+
+# Next's own /api/v1/{projectId} routes (end-user auth, healthz, and every route
+# recordedV1 wraps) answer a locked or paused project with the runtime gate's
+# 503, codes and words, and reach their handlers again once it serves.
+tests/integration/next-routes-serving-gate.spec.ts
+
 # Credential surfaces are held to a role, not to membership. The Connect page's
 # routes (mint/revoke MCP keys, read/provision/rotate direct Postgres
 # credentials, full pg_dump export) authorized with withProjectValidation alone,
@@ -175,6 +186,21 @@ __tests__/auth/operate-role-floors.test.ts
 # role, that the executor takes the service-role claims path, and the real
 # row flip both ways through the real executor door.
 __tests__/auth/block-user-rls.test.ts
+# A blocked end user's token is refused at request time under the app role.
+# The runtime's resolver and Next's v1 middleware read users.is_blocked with no
+# claims, which FORCE row-level security answers with no row for a
+# non-bypassing role, so the token was accepted. Pins the premise and both
+# checks with the project's client running as such a role.
+__tests__/auth/blocked-token-under-app-role.test.ts
+# Every other path that takes or issues an end-user token applies revocation
+# and blocking, under the same non-bypassing role: Next's v1 middleware reads a
+# token in Authorization as the runtime does, the storage download and
+# accept-invite resolve theirs through the shared check (accept-invite reading
+# the email as the service role), OAuth, magic-link and reset sign-ins refuse a
+# blocked user and still sign the others in, and the function runner gives a
+# revoked or blocked token no identity. Real users, link and teams tables, and
+# the real flows, are the property.
+__tests__/auth/end-user-token-paths.test.ts
 # ENABLE_REALTIME answered "Realtime active" for tables that never streamed: a
 # failed CREATE TRIGGER (missing/wrong-case table) was a footnote under the
 # banner, a refused table (internal, auth-managed users) was listed under
@@ -189,6 +215,11 @@ __tests__/services/realtime-enable-honesty.test.ts
 # non-superuser role, all three writes through the service-role machinery
 # (environment-independent mechanism pin), and the real row effects.
 __tests__/database/dashboard-row-writes-rls.test.ts
+
+# A realtime change reaches a subscriber only if that subscriber could select
+# the row: a real own-rows policy, two end users, anonymous and service-role
+# subscribers, deletes reduced to the key, and a table without a primary key.
+__tests__/database/realtime-row-visibility.test.ts
 # Schema snapshots stored ZERO tables (the parser expected a format the
 # introspector never emitted), so the History snapshot view was always empty
 # and rollback diffed two empty sets and reported "Dropped 0 table(s)" as
@@ -1079,6 +1110,15 @@ tests/integration/reset-password-sends-link.spec.ts
 # property, so it needs a real Postgres.
 tests/integration/project-region.spec.ts
 
+# A regional project's customer data on platform rows stays in its region: a
+# second database stands in for another region's, holding the real
+# regional_bodies table. Webhook and trigger payloads and replies, and function
+# run logs and errors, are kept there and nowhere in the home database; retries,
+# replays and listings read them back; a home project is unchanged; the region
+# prunes after 30 days. Two real databases and a real receiver are the
+# property, so it needs a real Postgres.
+tests/integration/regional-bodies.spec.ts
+
 # Model spend on the MCP tool route is gated and charged wherever it happens:
 # functions.schedule is refused up front with no credits and charged exactly
 # what its model calls used; integrations.connect stores the key with no
@@ -1128,3 +1168,52 @@ tests/integration/dashboard-stats-counts.spec.ts
 # routes answer 404, and the approval card names the trigger. Real trigger and
 # approval rows are the property, so it needs a real Postgres.
 tests/integration/delete-trigger-scope.spec.ts
+# Regional jobs: a snapshot or restore of a project kept in another region,
+# asked for at home and carried out in that region. No generic worker can claim
+# one, each region claims its own, a run past its timeout counts as an attempt,
+# and a failure records the platform's sentence, never the database's. Real
+# background_jobs rows and the claim's SQL are the property, so it needs a real
+# Postgres.
+__tests__/queue/regional-jobs.test.ts
+
+# The daily cleanup's 90-day retention of approval requests (from their
+# decision, or their expiry when nobody decided) and security events. Real rows
+# and deleteMany filters are the property, so it needs a real Postgres.
+__tests__/queue/retention.test.ts
+
+# Each region's copy of what authorizes its projects' requests: the capture
+# triggers from the migration, delivery to a second database standing in for a
+# region, the watermark, removal of revoked keys and deleted projects, the
+# encrypted signing secret, and a copy out of step after a restore emptied and
+# delivered afresh. The triggers and both databases are the property, so it
+# needs a real Postgres.
+tests/integration/auth-projection.spec.ts
+
+# A regional request authorized from the region's copy while it is fresh: off
+# reads home only, enforce reads the copy and fails closed (503
+# AUTHORIZATION_UNAVAILABLE) when the copy is stale and home cannot answer,
+# shadow answers from home and reports differences, end-user tokens verify
+# against the copy's secret, and a delivered lock refuses the project. Both
+# databases and the Express app are the property, so it needs a real Postgres.
+tests/integration/auth-projection-reads.spec.ts
+
+# A key's rate limit counted in its project's region once the copy is enforced:
+# home's rules (limit, a new window when the old one ends, its length changes
+# or the key is rotated), atomic under concurrency, one counter for the Express
+# runtime and the Next-owned routes with no write home per request, the mirror
+# of counts home for the console, and home counting while off or in shadow.
+# Both databases and the real SQL are the property, so it needs a real Postgres.
+tests/integration/auth-rate-windows.spec.ts
+
+# A revocation reported done only once the project's region has it: a home
+# project's change is not applicable, a regional key's revocation is confirmed
+# with the copy no longer holding the key, a region that cannot apply it leaves
+# it pending within the time allowed, and a lockdown reports where it stands.
+# Both databases and the real SQL are the property, so it needs a real Postgres.
+tests/integration/auth-projection-confirm.spec.ts
+
+# The SDK's data routes (/database/insert, update, delete and query) bind each
+# value as its column's type: a uuid, timestamp, numeric, integer, boolean and
+# jsonb column are written and filtered through each route. What PostgreSQL
+# accepts is the property, so it needs a real Postgres.
+tests/integration/v1-database-typed-columns.spec.ts

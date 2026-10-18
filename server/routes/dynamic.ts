@@ -15,10 +15,11 @@
 import { Router } from 'express'
 import type { Request, Response } from 'express'
 import { prisma } from '@/lib/db'
-import { isRegionError, workspaceRawClient } from '@/lib/data-plane/regional'
+import { isRegionError } from '@/lib/data-plane/regional'
+import { authorizingKeyByHash, isAuthorizationUnavailable } from '@/lib/auth-projection/read'
 import { verify } from 'jsonwebtoken'
-import { enforceRateLimitByKeyId } from '../lib/auth'
-import { resolveJwtSecret } from '@/lib/services/jwtSecretManager'
+import { enforceKeyRateLimit, enforceRateLimitByKeyId } from '../lib/auth'
+import { regionalRateCounting, type RateKey } from '@/lib/auth-projection/rate'
 import { hashApiKey, resolveEndUserFromToken, crossEnvironmentUserToken } from '../lib/end-user-identity'
 import { handleViaPostgrest } from './postgrest-handler'
 import { isFunctionSwitchedOff } from '@/lib/services/ai-functions/status'
@@ -36,6 +37,7 @@ import {
   isMcpCredential,
   mcpKeyRefusalMessage,
 } from '@/lib/security/key-placement'
+import { endUserBearerToken } from '@/lib/security/end-user-bearer'
 import { asyncRoute } from '../lib/async-route'
 import { refuseUnlessServing } from '../lib/serving-gate'
 import { touchProjectActivity } from '@/lib/projects/activity'
@@ -75,6 +77,8 @@ interface AuthResolution {
    * authority in the token (end-user RLS, platform service-role), not here.
    */
   permissions?: string[]
+  /** What the key's rate-limit window is counted by, when a key authenticated. */
+  rateKey?: RateKey
   error?: string
   code?: string
   /** Replaces the generic "include a credential" hint when the credential was present but wrong. */
@@ -117,19 +121,33 @@ export function refuseIfKeyLacksMethodPermission(
   return true
 }
 
+/**
+ * The status for a refused authentication on a data door. A refusal of a
+ * valid credential (a key used where it may not be, an end user the project
+ * blocked) is 403: the caller is known and refused, and 401 would send them to
+ * re-issue a credential that is fine. Anything else is 401.
+ */
+export function authRefusalStatus(code: string | undefined): 401 | 403 {
+  return isKeyPlacementRefusal(code) || code === 'END_USER_BLOCKED' ? 403 : 401
+}
+
+/**
+ * The end-user token in `Authorization: Bearer`, for a request that brings the
+ * project's key in x-api-key and no X-User-Token. Only a token that names a
+ * project (an end-user token) is taken; a platform session token is not one,
+ * and the key path never reads it as a user. The rule is shared with the Next
+ * v1 routes (lib/security/end-user-bearer.ts).
+ */
+export function endUserBearer(req: Request): string | undefined {
+  return endUserBearerToken(req.headers['authorization'] as string | undefined)
+}
+
 export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution> {
   const xApiKey = req.headers['x-api-key'] as string | undefined
   if (xApiKey) {
     const keyHash = hashApiKey(xApiKey)
-    const key = await prisma.apiKey.findFirst({
-      where: { keyHash },
-      select: {
-        id: true, name: true, keyPrefix: true, projectId: true, userId: true,
-        permissions: true, rateLimit: true, expiresAt: true, serviceRole: true,
-        scope: true, keyType: true,
-        branch: { select: { id: true, schemaName: true, status: true, name: true } },
-      },
-    })
+    // The region's copy while it is fresh, home otherwise (lib/auth-projection/read.ts).
+    const key = await authorizingKeyByHash(keyHash)
     if (!key) return { success: false, error: 'Invalid API key', code: 'INVALID_API_KEY' }
     if (key.expiresAt && key.expiresAt < new Date()) return { success: false, error: 'API key has expired', code: 'API_KEY_EXPIRED' }
     if (!key.projectId) return { success: false, error: 'API key is not associated with a project', code: 'NO_PROJECT_ID' }
@@ -173,7 +191,11 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
         }
       }
     }
-    prisma.apiKey.update({ where: { id: key.id }, data: { lastUsed: new Date() } }).catch(console.error)
+    // Counted in the region, the key's last use goes home with its count
+    // (lib/auth-projection/rate.ts), rather than as a write per request.
+    if (!regionalRateCounting()) {
+      prisma.apiKey.update({ where: { id: key.id }, data: { lastUsed: new Date() } }).catch(console.error)
+    }
 
     // A key bound to a branch that was merged or discarded must NOT silently
     // fall back to main. That is the one failure mode branch routing can have
@@ -192,6 +214,8 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
     // RLS identity:
     //   - service-role key → bypass RLS (backends, cron, internal tools)
     //   - non-service key + X-User-Token → act as that end-user (own_rows)
+    //   - non-service key + Authorization: Bearer <end-user token>, when no
+    //     X-User-Token is sent → the same, through the same resolver
     //   - non-service key, no user token → no user context (own_rows → empty)
     //
     // On a branch key the user token must have been issued on that branch.
@@ -201,7 +225,7 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
     let endUserId: string | undefined
     let userRole: string | undefined
     if (!key.serviceRole) {
-      const userToken = req.headers['x-user-token'] as string | undefined
+      const userToken = (req.headers['x-user-token'] as string | undefined) ?? endUserBearer(req)
       const branch = key.branch
         ? { id: key.branch.id, name: key.branch.name, schemaName: key.branch.schemaName }
         : null
@@ -264,6 +288,7 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
       branchSchema: key.branch?.schemaName,
       branchName: key.branch?.name,
       permissions: key.permissions ?? [],
+      rateKey: { id: key.id, keyHash, rateLimit: key.rateLimit, rateLimitWindow: key.rateLimitWindow },
     }
   }
 
@@ -290,41 +315,18 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
             hint: 'Sign the user in with the same key you use for data requests.',
           }
         }
-        // End-user token — verify with project.jwtSecret
-        const project = await prisma.project.findUnique({
-          where: { id: unverified.projectId },
-          select: { id: true, jwtSecret: true },
-        })
-        if (!project?.jwtSecret) return { success: false, error: 'Invalid token', code: 'INVALID_TOKEN' }
-        const decoded: any = verify(token, resolveJwtSecret(project.jwtSecret), { algorithms: ['HS256'] })
-        if (!decoded?.userId) return { success: false, error: 'Invalid token', code: 'INVALID_TOKEN' }
-        // Reject tokens revoked via /auth/logout.
-        if (decoded.jti) {
-          // The blacklist is in the project's database, in its region.
-          // Resolved outside the catch below, which reads any failure as "not
-          // revoked": a region this process cannot reach must not be.
-          const db = await workspaceRawClient(decoded.projectId)
-          try {
-            const schemaName = `workspace_${decoded.projectId}`
-            const rows = await db.$queryRawUnsafe<{ jti: string }[]>(
-              `SELECT jti FROM "${schemaName}"."_token_blacklist" WHERE jti = $1 LIMIT 1`,
-              decoded.jti,
-            )
-            if (rows.length > 0) {
-              return { success: false, error: 'Token has been revoked. Please sign in again.', code: 'TOKEN_REVOKED' }
-            }
-          } catch {
-            // Blacklist table doesn't exist yet — not revoked.
-          }
-        }
-        // End-user JWT → RLS scopes to their own rows.
+        // An end-user token says WHO is asking; the project's key says through
+        // what. The key carries the project's permission set and rate limit,
+        // and with it the token goes through the one end-user resolver (its
+        // revocation, block and branch checks). So the data plane takes an
+        // end-user token only together with a key, as the client docs and the
+        // SDK always send it; Authorization: Bearer is still read as the token
+        // when the key comes in x-api-key.
         return {
-          success: true,
-          projectId: decoded.projectId,
-          userId: decoded.userId,
-          endUserId: String(decoded.userId),
-          isServiceRole: false,
-          userRole: decoded.role ?? 'user',
+          success: false,
+          error: "End-user tokens are accepted with the project's key: send the key as x-api-key and this token as X-User-Token (or keep it in Authorization).",
+          code: 'API_KEY_REQUIRED',
+          hint: "Add the project's publishable key in the x-api-key header.",
         }
       }
 
@@ -342,8 +344,9 @@ export async function getProjectIdFromAuth(req: Request): Promise<AuthResolution
       if (!user || user.projects.length === 0) return { success: false, error: 'No project found for user', code: 'NO_PROJECT' }
       return { success: true, projectId: user.projects[0].id, userId: user.id, isServiceRole: true }
     } catch (err) {
-      // An unreachable region is the server's fault, not the token's.
-      if (isRegionError(err)) throw err
+      // An unreachable region, or authorization that could not be checked, is
+      // the server's fault, not the token's.
+      if (isRegionError(err) || isAuthorizationUnavailable(err)) throw err
       return { success: false, error: 'Invalid or expired token', code: 'INVALID_TOKEN' }
     }
   }
@@ -398,10 +401,10 @@ async function handleDynamicRequest(req: Request, res: Response) {
   if (!authResult.success) {
     // A valid key used in the wrong place is refused, not unauthenticated: 401
     // would send the developer to re-issue a key that is fine. Matches /api/v2.
-    res.status(isKeyPlacementRefusal(authResult.code) ? 403 : 401).json({
+    res.status(authRefusalStatus(authResult.code)).json({
       error: authResult.error || 'Authentication required',
       code: authResult.code || 'AUTHENTICATION_REQUIRED',
-      hint: authResult.hint ?? 'Include x-api-key header or Authorization: Bearer token',
+      hint: authResult.hint ?? "Include the project's key in x-api-key, and an end user's token in X-User-Token.",
     })
     return
   }
@@ -583,7 +586,7 @@ async function handleDynamicRequest(req: Request, res: Response) {
 
   // Enforce hard rate limit on API key routes (JWT-authed dynamic routes skip this)
   if (keyId) {
-    const rl = await enforceRateLimitByKeyId(keyId)
+    const rl = authResult.rateKey ? await enforceKeyRateLimit(authResult.rateKey) : await enforceRateLimitByKeyId(keyId)
     res.setHeader('X-RateLimit-Remaining', String(rl.remaining))
     res.setHeader('X-RateLimit-Reset', String(Math.floor(rl.resetAt.getTime() / 1000)))
 

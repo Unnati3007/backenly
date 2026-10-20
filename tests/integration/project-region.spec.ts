@@ -32,6 +32,7 @@
 
 import '@/tests/helpers/real-web-standard'
 import { randomBytes, randomUUID } from 'node:crypto'
+import fs from 'node:fs'
 import jwt from 'jsonwebtoken'
 import { NextRequest } from 'next/server'
 import { Client } from 'pg'
@@ -90,8 +91,8 @@ import { PROBE_REGISTRY } from '@/lib/autonomy/hypothesis/probes'
 import { executeMaintenanceAddStructure } from '@/lib/autonomy/maintenance/primitives/add-structure'
 import { dualWriteInstalled, installDualWrite, removeDualWrite } from '@/lib/autonomy/maintenance/primitives/dual-write'
 import { runBackfillBatch } from '@/lib/autonomy/maintenance/primitives/backfill'
-import { estimateDataMigration, executeDataMigration, rollbackDataMigration } from '@/lib/execution/data-migration'
-import { mkdtempSync, rmSync } from 'fs'
+import { estimateDataMigration, executeDataMigration } from '@/lib/execution/data-migration'
+import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { measureProjectDbBytes, snapshotProjectDbStorage } from '@/lib/usage/db-storage'
@@ -183,6 +184,12 @@ beforeAll(async () => {
   await run(homeUrl(), `CREATE DATABASE "${REGIONAL_DB}"`)
   regionalDbCreated = true
   await seedMarker(regionalUrl, schemaOf(regionalProject), 'us-east-1')
+  // The table a region keeps its projects' bodies in, a governed change's
+  // catalogs among them (lib/changes/residency.ts), as the region's database
+  // procedure installs it; backenly_app_role() names the role the application
+  // connects as.
+  await run(regionalUrl, `CREATE FUNCTION public.backenly_app_role() RETURNS text LANGUAGE sql AS $$ SELECT current_user::text $$`)
+  await run(regionalUrl, fs.readFileSync('scripts/sql/regional-bodies.sql', 'utf8'))
 
   // The workspace row a provisioned project has, so getWorkspacePostgresClient
   // goes straight to its queries instead of provisioning.
@@ -237,8 +244,15 @@ describe('a home-region project', () => {
     expect(rows).toEqual([{ db: homeDb, note: 'home' }])
   })
 
-  it('keeps the shared raw client', async () => {
-    expect(await workspaceRawClient(homeProject)).toBe(prisma)
+  it('runs raw SQL on the home database, on a client of its own rather than the platform one', async () => {
+    // Workspace SQL runs with Prisma's statement cache off and the platform's
+    // own queries keep it (lib/data-plane/statement-cache.ts).
+    const raw = await workspaceRawClient(homeProject)
+    expect(raw).not.toBe(prisma)
+    const rows = await raw.$queryRawUnsafe<{ db: string; note: string }[]>(
+      `SELECT current_database() AS db, note FROM "${schemaOf(homeProject)}".marker`,
+    )
+    expect(rows).toEqual([{ db: homeDb, note: 'home' }])
   })
 })
 
@@ -366,26 +380,69 @@ describe('schema introspection reads the project’s own database', () => {
   })
 })
 
-describe('schema history is recorded and rolled back in the project’s region', () => {
+describe('schema history and governed changes are recorded and restored in the project’s region', () => {
   // Read from the home database, a regional project's schema has no tables: a
-  // snapshot recorded none, and a rollback diffed two empty sets and reported
-  // there was nothing to roll back while the table it should drop stayed.
+  // snapshot recorded none, a change's checkpoint would be empty, and a
+  // restore would run against a database that does not hold the schema.
   const probe = () => `"${schemaOf(regionalProject)}".rollback_probe`
+  const originalEngineMode = process.env.ENGINE_MODE
   let versionId = ''
+  let changeId = ''
 
-  afterAll(async () => {
-    await run(regionalUrl, `DROP TABLE IF EXISTS ${probe()} CASCADE`).catch(() => {})
-    await prisma.schemaVersion.deleteMany({ where: { projectId: regionalProject } }).catch(() => {})
+  beforeAll(async () => {
+    // The ledger records nothing in integration mode, which runs no DDL.
+    process.env.ENGINE_MODE = 'runtime'
   })
 
-  it('records the regional schema, and rolls back a table added there since', async () => {
+  afterAll(async () => {
+    process.env.ENGINE_MODE = originalEngineMode
+    await run(regionalUrl, `DROP TABLE IF EXISTS ${probe()} CASCADE`).catch(() => {})
+    await prisma.schemaVersion.deleteMany({ where: { projectId: regionalProject } }).catch(() => {})
+    // The change lock holds connections to the regional database, which is
+    // dropped at the end of the suite.
+    const { closeChangeLockPool } = await import('@/lib/changes/lock')
+    await closeChangeLockPool()
+  })
+
+  it('records the regional schema in a snapshot', async () => {
     process.env[REGION_VARIABLE] = regionalUrl
     versionId = await snapshotSchema(regionalProject, 'before rollback_probe', 'test')
     expect((await getSchemaVersion(versionId, regionalProject))?.snapshot.tables.map((t) => t.name)).toEqual(['marker'])
+  })
 
-    await run(regionalUrl, `CREATE TABLE ${probe()} (id int PRIMARY KEY)`)
-    const result = await rollbackToVersion(regionalProject, versionId)
-    expect(result).toMatchObject({ success: true, message: expect.stringMatching(/Dropped 1 table/) })
+  it('checkpoints, applies and verifies a change in the region, quoting none of its SQL at home', async () => {
+    process.env[REGION_VARIABLE] = regionalUrl
+    const { withChangeAttribution, withGovernedChange } = await import('@/lib/changes/ledger')
+    const { change } = await withChangeAttribution({ source: 'dashboard', actorUserId: ownerId }, () =>
+      withGovernedChange(
+        { projectId: regionalProject, title: 'apply_migration: CREATE TABLE rollback_probe', regionalTitle: 'apply_migration: 1 statement' },
+        async () => {
+          const db = await workspaceRawClient(regionalProject)
+          await db.$executeRawUnsafe(`CREATE TABLE ${probe()} (id int PRIMARY KEY)`)
+        },
+      ))
+    expect(change).toMatchObject({ status: 'healthy' })
+    changeId = change!.id
+
+    const row = await prisma.backendChange.findUniqueOrThrow({ where: { id: changeId } })
+    // Read in the region: from the home database, where the schema is not,
+    // the table would be invisible before and after, the change a no-op with
+    // no record at all.
+    expect((row.footprint as any[]).map((c) => c.after)).toEqual(['rollback_probe'])
+    expect((row.checkpoint as any).database.schema).toBe(schemaOf(regionalProject))
+    // Names and counts only on the home record.
+    expect(row.title).toBe('apply_migration: 1 statement')
+    expect(row.statements).toEqual([])
+    expect((row.verification as any).outcome).toBe('confirmed')
+  })
+
+  it('restores the state before it in the region, keeping what it removes there', async () => {
+    process.env[REGION_VARIABLE] = regionalUrl
+    const { previewRecovery, recoverChange } = await import('@/lib/changes/recovery')
+    const preview = await previewRecovery(regionalProject, changeId)
+    expect(preview).toMatchObject({ safety: 'lossless' })
+    const out = await recoverChange(regionalProject, changeId, { mode: 'manual', actorUserId: ownerId })
+    expect(out).toMatchObject({ ok: true, status: 'restored' })
 
     const left = await rowsIn<{ table_name: string }>(
       regionalUrl,
@@ -393,13 +450,27 @@ describe('schema history is recorded and rolled back in the project’s region',
     )
     expect(left.map((t) => t.table_name)).toEqual(['marker'])
     expect(await rowsIn(regionalUrl, `SELECT note FROM "${schemaOf(regionalProject)}".marker`)).toEqual([{ note: 'us-east-1' }])
+    // The table it removed is kept in the restore's vault, in the region.
+    const vault = `${schemaOf(regionalProject)}_r${(out as { recoverySeq: number }).recoverySeq}`
+    expect(await rowsIn(regionalUrl, `SELECT 1 FROM pg_namespace WHERE nspname = '${vault}'`)).toHaveLength(1)
+    expect(await rowsIn(homeUrl(), `SELECT 1 FROM pg_namespace WHERE nspname = '${vault}'`)).toHaveLength(0)
   })
 
-  it('refuses without a connection to the region, never recording an empty schema or reporting nothing to roll back', async () => {
+  it('refuses without a connection to the region, never recording an empty schema or a change it cannot see', async () => {
     delete process.env[REGION_VARIABLE]
     const refused = { code: 'REGION_NOT_CONFIGURED' }
     await expect(snapshotSchema(regionalProject, 'no connection', 'test')).rejects.toMatchObject(refused)
-    await expect(rollbackToVersion(regionalProject, versionId)).rejects.toMatchObject(refused)
+    const { withGovernedChange } = await import('@/lib/changes/ledger')
+    const before = await prisma.backendChange.count({ where: { projectId: regionalProject } })
+    await expect(withGovernedChange({ projectId: regionalProject, title: 'no connection' }, async () => {})).rejects.toMatchObject(refused)
+    expect(await prisma.backendChange.count({ where: { projectId: regionalProject } })).toBe(before)
+  })
+
+  it('the retired version rollback changes nothing, in any region', async () => {
+    process.env[REGION_VARIABLE] = regionalUrl
+    const result = await rollbackToVersion(regionalProject, versionId)
+    expect(result).toMatchObject({ success: false, statementsExecuted: [] })
+    expect(result.message).toMatch(/Database → Changes/)
   })
 })
 
@@ -1410,7 +1481,9 @@ describe('typed data migrations run in the project’s region', () => {
     await run(regionalUrl, `DROP TABLE IF EXISTS ${statuses()} CASCADE`).catch(() => {})
   })
 
-  it('estimates, applies with its checkpoint, and rolls back, in the region', async () => {
+  // Undoing it is restoring its governed change, which the governed-change block
+  // below proves runs in the region; rollbackDataMigration is retired.
+  it('estimates and applies with its checkpoint, in the region', async () => {
     process.env[REGION_VARIABLE] = regionalUrl
 
     expect(await estimateDataMigration(regionalProject, normalize)).toEqual([
@@ -1424,9 +1497,6 @@ describe('typed data migrations run in the project’s region', () => {
     expect(await rowsIn(regionalUrl, `SELECT status FROM "${schemaOf(regionalProject)}"."${checkpoint}" ORDER BY id`)).toEqual([
       { status: 'Open' }, { status: 'open' }, { status: 'closed' },
     ])
-
-    expect(await rollbackDataMigration(regionalProject, 'statuses', checkpoint)).toEqual({ success: true })
-    expect(await values()).toEqual(['Open', 'open', 'closed'])
   })
 
   it('refuses without a connection to the region, and runs nothing anywhere else', async () => {
@@ -1434,7 +1504,6 @@ describe('typed data migrations run in the project’s region', () => {
     const refused = { code: 'REGION_NOT_CONFIGURED' }
     await expect(estimateDataMigration(regionalProject, normalize)).rejects.toMatchObject(refused)
     await expect(executeDataMigration(regionalProject, normalize)).rejects.toMatchObject(refused)
-    await expect(rollbackDataMigration(regionalProject, 'statuses', '_dm_backup_20261017000000_statuses')).rejects.toMatchObject(refused)
   })
 })
 
@@ -2215,5 +2284,62 @@ describe('deleting a project in another region', () => {
     expect(await schemaExists(regionalUrl, regional.schema)).toBe(false)
     expect(await roleExists(regional.role)).toBe(false)
     expect(await prisma.user.findUnique({ where: { id: user.id } })).toBeNull()
+  })
+})
+
+describe('the migration runner works in the project’s own region', () => {
+  // A project kept in another region whose schema name also exists in the home
+  // database, as one provisioned before project rows waited for the region's
+  // schema could leave behind. The home copy must never stand in for it.
+  const originalEngineMode = process.env.ENGINE_MODE
+  let stale = ''
+  const schemaAt = async (url: string, schema: string) =>
+    (await rowsIn<{ n: number }>(url, `SELECT count(*)::int AS n FROM pg_namespace WHERE nspname = '${schema}'`))[0].n > 0
+
+  beforeAll(async () => {
+    process.env.ENGINE_MODE = 'runtime'
+    stale = await createProject('us-east-1')
+    await seedMarker(homeUrl(), schemaOf(stale), 'left at home')
+  })
+
+  afterAll(async () => {
+    process.env.ENGINE_MODE = originalEngineMode
+    delete process.env[REGION_VARIABLE]
+    if (stale) {
+      await run(homeUrl(), `DROP SCHEMA IF EXISTS "${schemaOf(stale)}" CASCADE`).catch(() => {})
+      await prisma.project.deleteMany({ where: { id: stale } }).catch(() => {})
+    }
+  })
+
+  it('checks the region’s tables, not a copy left in the home database', async () => {
+    process.env[REGION_VARIABLE] = regionalUrl
+    const { verifyTablesExist } = await import('@/lib/execution/migration-runner')
+    expect(await verifyTablesExist(regionalProject, ['marker'])).toMatchObject({ exists: true, foundTables: ['marker'] })
+    expect(await verifyTablesExist(stale, ['marker'])).toMatchObject({ exists: false, foundTables: [] })
+  })
+
+  it('reads nothing from the home database when the region has no connection', async () => {
+    delete process.env[REGION_VARIABLE]
+    const { verifyTablesExist } = await import('@/lib/execution/migration-runner')
+    expect(await verifyTablesExist(stale, ['marker'])).toMatchObject({ exists: false, foundTables: [] })
+  })
+
+  it('creates nothing in the home database for a project kept in another region', async () => {
+    delete process.env[REGION_VARIABLE]
+    const { runMigration } = await import('@/lib/execution/migration-runner')
+    const dir = mkdtempSync(join(tmpdir(), 'region-migration-'))
+    const schemaPath = join(dir, 'schema.prisma')
+    writeFileSync(schemaPath, 'datasource db {\n  provider = "postgresql"\n  url      = env("DATABASE_URL")\n}\n\nmodel Note {\n  id Int @id\n}\n')
+    const fresh = await createProject('us-east-1')
+    try {
+      const result = await runMigration(fresh, schemaPath, 'region-check')
+      expect(result.success).toBe(false)
+      expect(result.error).toMatch(/DATABASE_URL_US_EAST_1 is not set/)
+      expect(await schemaAt(homeUrl(), `workspace_${fresh}`)).toBe(false)
+    } finally {
+      await run(homeUrl(), `DROP SCHEMA IF EXISTS "workspace_${fresh}" CASCADE`).catch(() => {})
+      await prisma.project.deleteMany({ where: { id: fresh } }).catch(() => {})
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

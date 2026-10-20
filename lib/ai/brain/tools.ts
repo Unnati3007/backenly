@@ -6,17 +6,18 @@
  * Design rules:
  *   - Every mutation tool is a thin wrapper over the existing `executeAction`
  *     (the 80-action executor in lib/ai/minimal-executor.ts). We REUSE it.
- *   - New control tools (propose_plan, ask_user, answer_question, run_test,
- *     rollback) live here and orchestrate brain-level concerns.
+ *   - New control tools (propose_plan, ask_user, answer_question, run_test)
+ *     live here and orchestrate brain-level concerns.
  *   - Tools return a compact JSON-safe summary the model can reason over.
  *   - Destructive tools are flagged so the agent loop can gate them.
  */
 
 import { executeAction } from '../minimal-executor'
 import type { AIAction } from '../minimal-executor'
+import { conversationFor } from './model'
+import type { ConversationTurn } from './memory'
 import { collectProof, formatProof } from '../proof-system'
 import { AiError, generate } from '../llm'
-import { answererPrompt } from './prompts'
 import { kickReconciler, shouldKickFor } from '@/lib/autonomy/event-trigger'
 import { WEBHOOK_EVENT_TYPES } from '@/lib/webhooks/events'
 import { publicOrigin } from '@/lib/branches/preview'
@@ -123,6 +124,8 @@ export type ToolName =
   | 'list_request_logs'
   // Deploy history
   | 'list_deploy_versions'
+  | 'list_schema_changes'
+  | 'revert_schema_change'
   // Integrations: what each can do, and whether its key still works
   | 'list_integration_capabilities'
   | 'verify_integration_key'
@@ -185,7 +188,6 @@ export type ToolName =
   | 'ask_user'
   | 'answer_question'
   | 'run_test'
-  | 'rollback'
   | 'finish'
 
 /**
@@ -195,7 +197,7 @@ export type ToolName =
  * exactly as issued, for a human to approve. No message can authorise one.
  * The executor also has its own approval-gate as defence-in-depth.
  */
-const DESTRUCTIVE_TOOLS = new Set<ToolName>([
+export const DESTRUCTIVE_TOOLS: ReadonlySet<ToolName> = new Set<ToolName>([
   // Data loss
   'drop_table',
   'truncate_table',
@@ -203,15 +205,20 @@ const DESTRUCTIVE_TOOLS = new Set<ToolName>([
   'delete_bucket',
   'delete_file',
   // NOTE: run_data_migration is NOT here — dry-runs must flow freely, and the
-  // executor's RUN_DATA_MIGRATION handler has its own confirmation gate that
-  // shows affected-row counts before a real run (destructiveConfirmed still
-  // forwards as params.confirmed so an explicit "confirm" applies it).
+  // executor's RUN_DATA_MIGRATION handler has its own gate that counts the
+  // rows a real run would change. The brain holds the call that gate stops
+  // for a person with those counts (lib/ai/brain/agent.ts), and approving it
+  // forwards destructiveConfirmed as params.confirmed, which applies it.
   // Breaks live SSE subscribers
   'disable_realtime',
   // Ships to / reverts production (engine also has its own "Type DEPLOY /
   // ROLLBACK" prompt — brain DESTRUCTIVE gate is the first-line check).
   'trigger_deploy',
   'rollback_deploy',
+  // Restores production to the state before a change. Nothing is destroyed
+  // (what the change added is kept in a vault) but every client of those
+  // tables sees the old shape, so a person decides. lib/changes/recovery.ts.
+  'revert_schema_change',
   // Breaks live API consumers
   'revoke_api_key',
   'rotate_api_key',
@@ -241,7 +248,8 @@ const DESTRUCTIVE_TOOLS = new Set<ToolName>([
 /**
  * Tools that do NOT mutate state. Used by the agent loop to decide whether the
  * turn needs a post-mutation verification pass. Everything not in this set OR
- * the control-tool list is treated as a mutation.
+ * the control-tool list is treated as a mutation, unless a call's arguments
+ * decide (READ_ONLY_WHEN below).
  */
 export const READ_ONLY_TOOLS = new Set<ToolName>([
   'read_backend_state',
@@ -259,6 +267,7 @@ export const READ_ONLY_TOOLS = new Set<ToolName>([
   'list_end_users',
   'list_permissions',
   'list_triggers',
+  'list_synced_columns',
   'list_ai_functions',
   'list_cron_jobs',
   'list_branches',
@@ -283,6 +292,7 @@ export const READ_ONLY_TOOLS = new Set<ToolName>([
   'list_ai_function_logs',
   'list_request_logs',
   'list_deploy_versions',
+  'list_schema_changes',
   'list_integration_capabilities',
   'get_connection_identity',
   'get_auth_email_settings',
@@ -296,6 +306,26 @@ export function isReadOnlyTool(name: string): boolean {
   return READ_ONLY_TOOLS.has(name as ToolName)
 }
 
+/**
+ * Tools whose arguments decide whether a call changes anything. A rule answers
+ * for its tool in place of READ_ONLY_TOOLS, and it reads the params the tool's
+ * mapper (TOOL_TO_ACTION) sends the executor, so how the agent loop counts a
+ * call and what the call does cannot disagree.
+ */
+const READ_ONLY_WHEN: Partial<Record<ToolName, (args: Record<string, unknown>) => boolean>> = {
+  // A dry run reports the rows it would touch and changes nothing.
+  run_data_migration: (a) => TOOL_TO_ACTION.run_data_migration(a).params.dryRun === true,
+  // Readiness changes nothing unless fixing is asked for, and then it can
+  // install RLS policies, generate the JWT secret and switch functions off.
+  get_readiness: (a) => TOOL_TO_ACTION.get_readiness(a).params.autoFix !== true,
+}
+
+/** Whether one call changes nothing: by its tool's rule above, else by READ_ONLY_TOOLS. */
+export function isReadOnlyCall(name: string, args: Record<string, unknown>): boolean {
+  const rule = READ_ONLY_WHEN[name as ToolName]
+  return rule ? rule(args) : isReadOnlyTool(name)
+}
+
 export interface ToolDispatchContext {
   projectId: string
   /** Owner of the project — required for autonomy + audit-log writes. */
@@ -307,12 +337,18 @@ export interface ToolDispatchContext {
   sessionToken?: string
   /** The user's most recent message — needed for answer_question. */
   userMessage?: string
+  /**
+   * The conversation before this turn: the turns the classifier is given.
+   * answer_question sends the last of them with the question, so a follow-up
+   * ("why the first one?") reaches the model with what it follows.
+   */
+  recentHistory?: ConversationTurn[]
   /** Pre-formatted project understanding block (from memory.formatUnderstanding). */
   understandingBlock?: string
   /**
-   * True when the user's message in this turn explicitly authorised a destructive
-   * action ("yes drop it", "confirm revoke"). Forwarded to the executor as
-   * `params.confirmed=true` so its approval gate doesn't double-prompt.
+   * True only on the replay of a call a person approved (runApprovedCall in
+   * lib/mcp/approvals.ts); no message sets it. Forwarded to the executor as
+   * `params.confirmed=true` so its own gate does not stop the approved call.
    */
   destructiveConfirmed?: boolean
   /**
@@ -641,7 +677,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
       tableName: { type: 'string' },
       on: { type: 'string', enum: ['insert', 'update', 'delete'] },
       kind: { type: 'string', enum: ['webhook', 'notify'] },
-      webhookUrl: { type: 'string', description: 'For kind "webhook" only — the HTTP(S) endpoint the trigger calls. Required for webhooks.' },
+      webhookUrl: { type: 'string', description: 'For kind "webhook" only — the https:// endpoint the trigger calls. Required for webhooks.' },
     },
     ['tableName', 'on', 'kind']),
   fn('sync_column',
@@ -747,7 +783,7 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     '  • merge_columns — concatenate columns into one: {op:"merge_columns", table, sources:[…], target, separator}\n' +
     '  • cast_column — change a column\'s type converting live data: {op:"cast_column", table, column, toType:"integer|bigint|numeric|boolean|timestamptz|date|text|uuid|jsonb", onError:"fail"|"null"}\n' +
     '  • normalize_values — rewrite values via a mapping (unify "Active"/"ACTIVE"→"active"): {op:"normalize_values", table, column, mapping:{from:to}}\n' +
-    'ALWAYS call with dryRun:true first and show the user the affected-row counts before running it for real.',
+    'ALWAYS call with dryRun:true first and show the user the affected-row counts. A real run waits for a person: the call is queued, with its affected-row counts, for the project owner to approve in the dashboard, and the approved call runs exactly these operations. Nothing typed in chat approves it.',
     {
       operations: {
         type: 'array',
@@ -909,6 +945,16 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     'Every published version, newest first: id, version number, change summary, when it was published, which one is serving, and which can be rolled back to (rollback_deploy takes the version or its id).',
     {},
     []),
+  fn('list_schema_changes',
+    'The change history: every governed change to the production backend, newest first, with its changeId and number, who made it (a coding agent, a person, Backenly autonomy), what it did, and how its lifecycle ended: applied and verified; recovered automatically after it failed verification; restored by a person; waiting for a person to approve its recovery; or needing attention. Also whether restoring the state before it is available. Every apply_migration, typed schema tool, approved drop and branch merge is recorded here, with the checkpoint taken before it. Side-effect free.',
+    { limit: { type: 'integer', minimum: 1, maximum: 50, description: 'How many changes, newest first (default 15).' } },
+    []),
+  fn('revert_schema_change',
+    'DESTRUCTIVE: waits for a person to approve. Ask for the backend to be restored to its state before one governed change. Backenly checks first: a restore that is impossible (a later change touched the same tables, its restore point expired) is answered at once; one that would set aside data written since the change says exactly what, and the person approves exactly that. The restore keeps everything it removes, runs in one transaction, and is verified against the restore point. You cannot run or approve it yourself. Take changeId from list_schema_changes or from the `change` an apply_migration response carries.',
+    {
+      changeId: { type: 'string', description: 'The change whose previous state to restore (its id, from list_schema_changes).' },
+    },
+    ['changeId']),
   // ── Integrations: capabilities and a key re-check ─────────────────────────
   fn('list_integration_capabilities',
     'What a function can call on each integration (the exact ctx.integrations.<id> method signatures), whether it is connected, and what its provider said about the key. For Stripe also the receiver URL and whether the signing secret is stored. Never returns a key.',
@@ -1189,6 +1235,22 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
           'constraints never collide.',
       },
       referencedTable: { type: 'string', description: 'For FOREIGN KEY: the table being referenced.' },
+      references: {
+        type: 'object',
+        description:
+          'For FOREIGN KEY: the key exactly as declared, { table, column?, onDelete, onUpdate, name? }, each action one of ' +
+          'NO ACTION, RESTRICT, CASCADE, SET NULL, SET DEFAULT, and no column meaning the table\'s primary key. Given, ' +
+          'the key is installed exactly so; without it Backenly picks the referenced column (id) and the actions. ' +
+          'apply_migration sends it for every FOREIGN KEY.',
+        properties: {
+          table: { type: 'string' },
+          column: { type: 'string' },
+          onDelete: { type: 'string', enum: ['NO ACTION', 'RESTRICT', 'CASCADE', 'SET NULL', 'SET DEFAULT'] },
+          onUpdate: { type: 'string', enum: ['NO ACTION', 'RESTRICT', 'CASCADE', 'SET NULL', 'SET DEFAULT'] },
+          name: { type: 'string' },
+        },
+        required: ['table', 'onDelete', 'onUpdate'],
+      },
     },
     ['tableName', 'constraintType']),
 
@@ -1442,15 +1504,12 @@ export const BRAIN_TOOLS: BrainToolSchema[] = [
     { question: { type: 'string' } },
     ['question']),
   fn('run_test',
-    "Verify a generated REST endpoint actually works by calling it with a sample payload and asserting the response. Use after generate_api on tables where freshness matters. Returns ok:false with status code + body on failure.",
+    "Verify a generated REST endpoint actually works by calling it with a sample payload and asserting the response. Use after generate_api on tables where freshness matters. Returns ok:false with status code + body on failure. get lists one row and fetches it by id, so it needs a row to exist; on an empty table use list.",
     {
       tableName: { type: 'string' },
       operation: { type: 'string', enum: ['list', 'create', 'get'] },
     },
     ['tableName', 'operation']),
-  fn('rollback',
-    'Undo the last N agent actions in this turn when verification fails or the user explicitly asks to rollback. Use sparingly — most failures should be fixed forward.',
-    { steps: { type: 'integer', minimum: 1, maximum: 10 } }),
   fn('finish',
     "End the turn. Call this when the user's request is fully satisfied OR when you need the user to answer a question / provide a credential before continuing. Provide a concise, product-voice summary.",
     {
@@ -1540,6 +1599,8 @@ export const TOOL_TO_ACTION: Record<string, (args: any) => AIAction> = {
       expression: a.expression,
       constraintName: a.constraintName,
       referencedTable: a.referencedTable,
+      // A foreign key exactly as declared (lib/db/declared-foreign-key.ts).
+      references: a.references,
     },
   }),
   generate_api: (a) => ({ action: 'GENERATE_API', params: { tableName: a.tableName } }),
@@ -2022,6 +2083,26 @@ function preflightValidate(
       }
       return null
     }
+    case 'create_trigger': {
+      // A webhook trigger posts every matching row to webhookUrl. The schema's
+      // `required` cannot say "required when kind is webhook", so it is checked
+      // here, before anything is stored or shown as started: without it the
+      // trigger was created calling `undefined` and every later write logged a
+      // dead delivery. https only, because the body is the row itself. Whether
+      // the address may be contacted at all is the outbound guard's decision,
+      // made when the trigger is stored and again on every delivery.
+      if (args.kind !== 'webhook') return null
+      const url = typeof args.webhookUrl === 'string' ? args.webhookUrl.trim() : ''
+      if (/^https:\/\//i.test(url)) return null
+      return {
+        ok: false,
+        code: 'INVALID_ARGUMENT',
+        summary: url
+          ? `create_trigger(kind="webhook") needs an https:// \`webhookUrl\`, and "${url.slice(0, 200)}" is not one. Nothing was created.`
+          : 'create_trigger(kind="webhook") needs a `webhookUrl` — the https:// endpoint each matching row is posted to. ' +
+            'Nothing was created. Pass it, or use create_webhook for a signed row webhook.',
+      }
+    }
     default:
       return null
   }
@@ -2164,6 +2245,9 @@ export async function dispatchTool(
         '- These never execute directly. Ask for them with their domain tool and the exact call is parked for a human on the project\'s Autonomy page: `deploy { action: "deploy" }`, `deploy { action: "rollback" }`, `functions { action: "delete" }`, `storage { action: "delete_bucket" }`, `connect { action: "revoke_api_key" }` and the others each tool\'s description marks. The response carries an `approval` id; poll `check_approval { id }` until it reports executed or rejected. Once approved, the call you sent runs verbatim.',
         '- Dropping a table or column, truncating a table and discarding a branch have no domain action: describe them to `backend_chat`, which parks them the same way.',
         '- The operation DOES happen — a human just confirms it first. You can request it; you cannot approve it.',
+        '- **Every change is governed**, whoever made it: Backenly takes a checkpoint first, applies it, then runs protected verification you cannot skip or change. A change that fails verification is recovered automatically when that is provably lossless, and otherwise waits for a person. The `change` in an apply_migration response says which (its status is healthy, recovered, awaiting approval or needing a person), with the reason.',
+        '- `deploy { action: "changes" }` lists changes and how each ended. To ask for the state before one, `deploy { action: "revert_change", changeId }`: a person approves it, and sees exactly what it would set aside first. You cannot run or approve a restore yourself.',
+        '- A migration on production applies completely or not at all. If a statement fails after others ran, those are rolled back automatically: `applied` in the response is what is live, `rolledBack` is what ran and was undone. Fix the failing statement and send the whole migration again.',
         '',
         '## 6. Ship',
         '- `read_backend_state { section: "readiness" }` first — the behavioural + security scorecard, with the exact blockers. Publishing runs this gate anyway and refuses on blockers, so reading it first saves a round trip.',
@@ -2551,12 +2635,23 @@ export async function dispatchTool(
     // ── Control: answer_question ──────────────────────────────────────────
     if (name === 'answer_question') {
       const question = String(args.question ?? ctx.userMessage ?? '').trim()
+      // The turns before this one, clipped as the classifier clips them. With
+      // the question alone, "why the first one?" reached the model with no
+      // first one in it.
+      const recent = (ctx.recentHistory ?? []).slice(-4).map((turn) => ({
+        role: turn.role,
+        content: turn.content.length > 600 ? turn.content.slice(0, 600) + '…' : turn.content,
+      }))
       try {
+        // Imported here, not at the top: prompts.ts reads DESTRUCTIVE_TOOLS from
+        // this module, and two modules importing each other at load hand one of
+        // them a half-initialised copy of the other.
+        const { answererPrompt } = await import('./prompts')
         const result = await generate({
           purpose: 'brain.answer',
           system: answererPrompt(),
           ...(ctx.understandingBlock ? { context: `THIS PROJECT:\n${ctx.understandingBlock}` } : {}),
-          messages: [{ role: 'user', content: question || 'Can you help me?' }],
+          messages: conversationFor(recent, question || 'Can you help me?'),
           billing: { projectId: ctx.projectId },
           label: 'brain-answer',
         })
@@ -3189,7 +3284,7 @@ export async function dispatchTool(
         lines.push('', `${driftPending} schema change(s) arrived over a direct DB connection — call adopt_external_schema to fold them into the contract, or review under Autonomy.`)
       }
       if (snapshot) {
-        lines.push('', `Latest restore point: v${snapshot.versionNum} (${snapshot.tableCount} tables, ${snapshot.createdAt.toISOString()}). Rollback is available from Autonomy → Restore points.`)
+        lines.push('', `Latest restore point: v${snapshot.versionNum} (${snapshot.tableCount} tables, ${snapshot.createdAt.toISOString()}). To restore the state before a change: Database → Changes, or ask with deploy { action: "revert_change", changeId } (a person approves it).`)
       }
       if (openRows.length === 0 && approvals.length === 0 && driftPending === 0) {
         // An empty queue is evidence only for the checks that ran. Say which
@@ -3324,16 +3419,76 @@ export async function dispatchTool(
       })
     }
 
-    // ── Rollback ──────────────────────────────────────────────────────────
-    if (name === 'rollback') {
-      const steps = Math.max(1, Math.min(10, Number(args.steps ?? 1)))
-      // Rollback is plumbed through the existing execution journal; for now
-      // we surface that the agent should fix-forward and call out the limit.
+    // ── Change history and recovery (lib/changes) ─────────────────────────
+    if (name === 'list_schema_changes') {
+      const { listChanges } = await import('@/lib/changes/history')
+      const limit = Math.max(1, Math.min(50, Number(args.limit ?? 15) || 15))
+      const { changes, windowDays } = await listChanges(ctx.projectId, { limit })
+      if (changes.length === 0) {
+        return finalize({ ok: true, summary: 'No changes recorded yet. Every governed change to the production backend is recorded here, with a checkpoint, from the first one on.', data: { changes: [], windowDays } })
+      }
+      const OUTCOME: Record<string, string> = {
+        healthy: 'applied and verified',
+        unverified: 'applied, not verified',
+        recovered: 'failed verification, recovered automatically',
+        restored: 'restored to the state before it',
+        awaiting_approval: 'failed verification, recovery waiting for a person',
+        kept: 'failed verification, kept as it is by a person',
+        needs_attention: 'failed, needs a person',
+        in_progress: 'in progress',
+      }
+      const lines = changes.map((c) => {
+        const restore = c.action?.available ? `${c.action.kind} available` : c.action?.reason ?? 'no restore available'
+        return `• #${c.seq} (${c.id}) ${c.summary} · ${OUTCOME[c.outcome.state] ?? c.outcome.state} · ${c.actor.label} · ${c.createdAt}` +
+          `${c.outcome.note ? `\n  ${c.outcome.note}` : ''}\n  ${restore}`
+      })
       return finalize({
-        ok: false,
+        ok: true,
+        summary: `Changes, newest first:\n${lines.join('\n')}\n\n` +
+          'To ask for the state before one, use deploy { action: "revert_change", changeId }: a person approves it.',
+        data: {
+          windowDays,
+          changes: changes.map((c) => ({
+            changeId: c.id, seq: c.seq, summary: c.summary, outcome: c.outcome.state, note: c.outcome.note,
+            actor: c.actor.label, createdAt: c.createdAt, touched: c.touched,
+            canRestore: !!c.action?.available && c.action.kind === 'restore',
+            ...(c.action && !c.action.available ? { whyNot: c.action.reason } : {}),
+          })),
+        },
+      })
+    }
+
+    if (name === 'revert_schema_change') {
+      // Reached only once a person has decided: over MCP the call is parked
+      // for approval, and in a brain run the destructive gate stops it first.
+      // What the person approved travels in `acknowledged`, computed by
+      // Backenly when the request was made, never taken from the agent.
+      const changeId = String(args.changeId ?? '').trim()
+      if (!changeId) return finalize({ ok: false, summary: '`changeId` is required. list_schema_changes gives each change\'s id.' })
+      if (!ctx.destructiveConfirmed) {
+        return finalize({ ok: false, summary: 'A restore runs only once a person approves it.', code: 'DESTRUCTIVE_NEEDS_APPROVAL' })
+      }
+      const { recoverChange } = await import('@/lib/changes/recovery')
+      const acknowledged = (args.acknowledged && typeof args.acknowledged === 'object' ? args.acknowledged : null) as Record<string, number> | null
+      const out = await recoverChange(ctx.projectId, changeId, {
+        mode: 'approved',
+        actorUserId: ctx.userId ?? null,
+        acknowledged,
+      })
+      if (!out.ok) {
+        // This tsconfig does not narrow on a boolean discriminant.
+        const fail = out as Extract<typeof out, { ok: false }>
+        const blocked = fail.blockedBy?.length ? ` Restore ${fail.blockedBy.map((b) => `#${b.seq}`).join(', ')} first.` : ''
+        return finalize({ ok: false, summary: `${fail.error}${blocked}`, code: fail.code, data: fail })
+      }
+      const done = out as Extract<typeof out, { ok: true }>
+      const kept = done.impact.items.filter((i) => i.needsApproval)
+      return finalize({
+        ok: true,
         summary:
-          `Rollback of ${steps} step(s) requested. The brain does not auto-rollback yet — use fix_backend or drop_table to undo manually, or ask the user for confirmation before destructive cleanup.`,
-        data: { stepsRequested: steps, supported: false },
+          `Restored the state before this change, and verified it (recorded as #${done.recoverySeq}).` +
+          (kept.length ? ` Kept in a recovery snapshot, as approved: ${kept.map((i) => i.detail).join(' ')}` : ''),
+        data: done,
       })
     }
 
@@ -3457,6 +3612,10 @@ function clip(s: string, max = 800): string {
 export function humanTitle(name: string, args: Record<string, unknown>): string {
   switch (name) {
     case 'read_backend_state': return 'Reading backend state'
+    case 'get_instructions': return 'Reading the agent instructions'
+    case 'get_backend_metadata': return 'Reading backend metadata'
+    case 'get_project_overview': return 'Reading the project overview'
+    case 'get_table_schema': return `Reading the schema of ${args.tableName ?? 'a table'}`
     case 'list_findings': return 'Checking open issues'
     case 'resolve_finding': return 'Resolving the issue'
     case 'get_pending_incidents': return 'Preparing your backend briefing'
@@ -3520,6 +3679,15 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'create_cron_job': return `Scheduling job (${args.schedule ?? ''})`.trim()
     case 'set_rate_limit': return `Setting rate limit on ${args.tableName ?? ''}`.trim()
     case 'generate_aggregate_api': return `Generating ${args.name ?? 'stats'} stats endpoint`.trim()
+    case 'run_data_migration': {
+      // It rewrites live rows, so the title names the tables it touches and
+      // says when the call is only the dry run that counts them.
+      const tables = Array.isArray(args.operations)
+        ? [...new Set(args.operations.map((op) => op?.table).filter((t) => typeof t === 'string' && t !== ''))]
+        : []
+      const scope = tables.length ? ` in ${tables.join(', ')}` : ''
+      return args.dryRun ? `Previewing a data migration${scope}` : `Migrating data${scope}`
+    }
     case 'enable_teams': return 'Setting up team multi-tenancy'
     case 'enable_push_notifications': return 'Connecting OneSignal'
     case 'send_push': return `Sending push${args.title ? `: ${args.title}` : ''}`.trim()
@@ -3557,7 +3725,16 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'drop_column': return `Dropping column ${args.columnName ?? ''} from ${args.tableName ?? ''}`.trim()
     case 'disable_realtime': return args.tableName ? `Disabling realtime on ${args.tableName}` : 'Disabling realtime project-wide'
     case 'rename_column': return `Renaming ${args.oldName ?? ''} → ${args.newName ?? ''} on ${args.tableName ?? ''}`.trim()
-    case 'add_constraint': return `Adding ${args.constraintType ?? 'constraint'} on ${args.tableName ?? ''}.${args.columnName ?? ''}`
+    case 'add_constraint': {
+      // `columns` wins over `columnName`, as it does in the executor. Reading
+      // only columnName titled a composite UNIQUE "Adding unique on
+      // conversations." with both of its columns missing.
+      const columns = Array.isArray(args.columns) && args.columns.length ? args.columns.join(', ') : ''
+      return columns
+        ? `Adding ${args.constraintType ?? 'constraint'} on ${args.tableName ?? ''} (${columns})`
+        : `Adding ${args.constraintType ?? 'constraint'} on ${args.tableName ?? ''}.${args.columnName ?? ''}`
+    }
+    case 'run_query': return 'Running a read-only query'
     case 'list_tables': return 'Listing tables'
     case 'list_apis': return 'Listing REST endpoints'
     case 'list_buckets': return 'Listing storage buckets'
@@ -3569,6 +3746,12 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'list_triggers': return 'Listing triggers'
     case 'list_ai_functions': return 'Listing AI functions'
     case 'list_cron_jobs': return 'Listing scheduled jobs'
+    case 'create_branch': return `Creating preview branch ${args.name ?? ''}`.trim()
+    case 'connect_branch': return `Issuing a ${args.serviceRole === true ? 'service-role' : 'client'} key for branch ${args.branchId ?? ''}`.trim()
+    case 'list_branches': return 'Listing preview branches'
+    case 'diff_branch': return `Diffing branch ${args.branchId ?? ''}`.trim()
+    case 'merge_branch': return `Merging branch ${args.branchId ?? ''} into production`.replace(/\s+/g, ' ')
+    case 'discard_branch': return `Discarding branch ${args.branchId ?? ''}`.trim()
     case 'list_integration_keys': return 'Listing integrations'
     case 'list_connected_apps': return 'Listing connected frontends'
     case 'get_deploy_status': return 'Reading deployment status'
@@ -3585,7 +3768,9 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'disconnect_frontend': return `Disconnecting frontend ${args.url ?? ''}`.trim()
     case 'trigger_deploy': return args.force ? 'Publishing backend' : 'Previewing deploy'
     case 'rollback_deploy': return args.version ? `Rolling back to v${args.version}` : 'Rolling back deployment'
-    case 'get_readiness': return 'Reading deploy readiness'
+    case 'list_schema_changes': return 'Reading the change history'
+    case 'revert_schema_change': return 'Restoring the state before a change'
+    case 'get_readiness': return isReadOnlyCall(name, args) ? 'Reading deploy readiness' : 'Applying the safe readiness fixes'
     case 'set_env_var': return `Saving env var ${args.key ?? ''}`.trim()
     case 'list_env_vars': return 'Listing project env vars'
     case 'delete_env_var': return `Deleting env var ${args.key ?? ''}`.trim()
@@ -3609,7 +3794,6 @@ export function humanTitle(name: string, args: Record<string, unknown>): string 
     case 'ask_user': return 'Asking for clarification'
     case 'answer_question': return 'Answering'
     case 'run_test': return `Testing ${args.operation ?? 'endpoint'} on ${args.tableName ?? ''}`.trim()
-    case 'rollback': return `Rolling back ${args.steps ?? 1} step(s)`
     case 'finish': return 'Wrapping up'
     default: return name
   }

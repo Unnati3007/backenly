@@ -80,14 +80,14 @@ import {
 } from '@/lib/api/database'
 import { isForeignKeyShaped, suggestForeignKeyColumn } from '@/lib/db/fk-shape'
 import { SqlWorkspace } from '@/components/database/SqlWorkspace'
-import { SchemaHistory } from '@/components/database/SchemaHistory'
+import { ChangeHistory } from '@/components/changes/ChangeHistory'
 import { EnumsPanel } from '@/components/database/EnumsPanel'
 import { ExtensionsPanel } from '@/components/database/ExtensionsPanel'
 import { DatabaseSnapshots } from '@/components/database/DatabaseSnapshots'
-import { useParams, useRouter } from 'next/navigation'
+import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import { getCurrentProjectId } from '@/lib/api/client'
 import { useAgentConnection } from '@/lib/hooks/useAgentConnection'
-import EnhancedSchemaVisualizer from '@/components/database/EnhancedSchemaVisualizer'
+import { SchemaDiagram } from '@/components/database/SchemaDiagram'
 
 
 type ViewMode = 'data' | 'structure'
@@ -201,7 +201,11 @@ export default function ProjectDatabasePage() {
   const [newRowData, setNewRowData] = useState<Record<string, any>>({})
   const [showQueryBuilder, setShowQueryBuilder] = useState(false)
   const [expandedSchemas, setExpandedSchemas] = useState<Set<string>>(new Set())
-  const [showVisualization, setShowVisualization] = useState<DatabaseView>('tables')
+  // ?view=changes opens Changes directly: links from approvals and the
+  // Autonomy feed land on the change they are about (?change=<id>).
+  const searchParams = useSearchParams()
+  const [showVisualization, setShowVisualization] = useState<DatabaseView>(() =>
+    searchParams?.get('view') === 'changes' ? 'history' : 'tables')
   const [isVisualizationExpanded, setIsVisualizationExpanded] = useState(false)
   
   // New table creation state
@@ -449,7 +453,7 @@ export default function ProjectDatabasePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchTerm])
 
-  // Handle ESC key to exit fullscreen
+  // Handle ESC key to exit fullscreen and toggle body class
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && isVisualizationExpanded) {
@@ -457,8 +461,19 @@ export default function ProjectDatabasePage() {
       }
     }
 
-    window.addEventListener('keydown', handleEscape)
-    return () => window.removeEventListener('keydown', handleEscape)
+    if (isVisualizationExpanded) {
+      document.body.classList.add('schema-fullscreen-active')
+      const prevOverflow = document.body.style.overflow
+      document.body.style.overflow = 'hidden'
+      window.addEventListener('keydown', handleEscape)
+      return () => {
+        document.body.classList.remove('schema-fullscreen-active')
+        document.body.style.overflow = prevOverflow
+        window.removeEventListener('keydown', handleEscape)
+      }
+    }
+
+    return () => {}
   }, [isVisualizationExpanded])
 
   // Chat-driven schema changes (ChatDock dispatches backenly:database-changed
@@ -1239,10 +1254,13 @@ export default function ProjectDatabasePage() {
       </CommandBar>
 
       {/* ── Views ───────────────────────────────────────────────
-          Tables and Schema read the workspace schema; SQL, History, Types,
+          Tables and Schema read the workspace schema; SQL, Changes, Types,
           Extensions and Snapshots are project-wide and need no table. */}
       {selectedSchema && (
-        <KitTabs className="flex-shrink-0 px-3 sm:px-4">
+        // contain:inline-size: seven tabs in one row are wider than a phone,
+        // and as min-content they widened the whole console column past the
+        // screen. Contained, the row scrolls sideways as overflow-x-auto intends.
+        <KitTabs className="flex-shrink-0 px-3 sm:px-4 [contain:inline-size]">
           {DATABASE_VIEWS.map((view) => {
             const Icon = view.icon
             return (
@@ -1396,7 +1414,9 @@ export default function ProjectDatabasePage() {
           {/* ── Main pane ─────────────────────────────────────── */}
           <div className="flex min-w-0 flex-1 flex-col">
             {showVisualization === 'history' && resolvedProjectId ? (
-              <SchemaHistory projectId={resolvedProjectId} />
+              // Every governed change to production, checked after it applied,
+              // with the way back in each row's menu.
+              <ChangeHistory projectId={resolvedProjectId} />
             ) : showVisualization === 'types' && resolvedProjectId ? (
               // Project-scoped: types live in the workspace schema and need no
               // selected table.
@@ -1416,33 +1436,74 @@ export default function ProjectDatabasePage() {
               // still be queried.
               <SqlWorkspace projectId={resolvedProjectId} />
             ) : showVisualization === 'visualization' && activeDb === 'postgresql' && selectedSchema ? (
-              <>
-                <div className={`flex h-[44px] flex-shrink-0 items-center justify-between gap-3 border-b ${RULE} pl-4 pr-2 sm:pl-5`}>
+              <div
+                className={
+                  isVisualizationExpanded
+                    ? `fixed inset-0 z-[100] flex h-screen w-screen flex-col ${KIT.bg}`
+                    : 'flex min-h-0 flex-1 flex-col overflow-hidden'
+                }
+              >
+                <div
+                  className={`flex ${
+                    isVisualizationExpanded ? 'h-[48px]' : 'h-[44px]'
+                  } flex-shrink-0 items-center justify-between gap-3 border-b ${RULE} ${
+                    isVisualizationExpanded ? 'pl-5 pr-3' : 'pl-4 pr-2 sm:pl-5'
+                  }`}
+                >
                   <div className="flex min-w-0 items-baseline gap-2.5">
-                    <h2 className="text-[13px] font-medium text-zinc-100">Schema graph</h2>
+                    <h2
+                      className={
+                        isVisualizationExpanded
+                          ? 'text-[14px] font-semibold tracking-[-0.014em] text-zinc-50'
+                          : 'text-[13px] font-medium text-zinc-100'
+                      }
+                    >
+                      Schema graph
+                    </h2>
                     <span className="hidden truncate text-[12px] text-zinc-500 sm:inline">
-                      Tables and the foreign keys between them
+                      {isVisualizationExpanded
+                        ? `${tables.length} ${tables.length === 1 ? 'table' : 'tables'} · Foreign key relationships`
+                        : 'Tables and the foreign keys between them'}
                     </span>
                   </div>
                   <div className="flex items-center gap-0.5">
-                    <IconButton icon={Maximize2} label="Full screen" onClick={() => setIsVisualizationExpanded(true)} />
                     <IconButton
-                      icon={RefreshCw}
-                      label="Refresh"
-                      onClick={handleRefresh}
-                      className={loading ? '[&_svg]:animate-spin' : ''}
+                      icon={isVisualizationExpanded ? Minimize2 : Maximize2}
+                      label={isVisualizationExpanded ? 'Exit full screen (F / Esc)' : 'Full screen (F)'}
+                      onClick={() => setIsVisualizationExpanded((prev) => !prev)}
                     />
+                    {!isVisualizationExpanded && (
+                      <IconButton
+                        icon={RefreshCw}
+                        label="Refresh"
+                        onClick={handleRefresh}
+                        className={loading ? '[&_svg]:animate-spin' : ''}
+                      />
+                    )}
                   </div>
                 </div>
                 <div className="min-h-0 flex-1 overflow-hidden">
-                  <EnhancedSchemaVisualizer
-                    schema={selectedSchema}
-                    databaseType={activeDb}
+                  <SchemaDiagram
                     projectId={resolvedProjectId || undefined}
-                    view={databaseView}
+                    activeSchema={selectedSchema}
+                    activeTable={selectedTable}
+                    databaseType={activeDb}
+                    isFullscreen={isVisualizationExpanded}
+                    onToggleFullscreen={() => setIsVisualizationExpanded((prev) => !prev)}
+                    onSelectTable={(tableName) => {
+                      setSelectedTable(tableName)
+                    }}
+                    onOpenTableData={(tableName) => {
+                      setSelectedTable(tableName)
+                      if (isVisualizationExpanded) {
+                        setIsVisualizationExpanded(false)
+                      }
+                      setShowVisualization('tables')
+                      setViewMode('data')
+                    }}
                   />
                 </div>
-              </>
+              </div>
             ) : selectedTable && selectedSchema ? (
               <>
                 {/* Table toolbar */}
@@ -1975,39 +2036,7 @@ export default function ProjectDatabasePage() {
         </div>
       </div>
 
-      {/* ── Full-screen schema graph ─────────────────────────── */}
-      <AnimatePresence>
-        {isVisualizationExpanded && selectedSchema && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.16 }}
-            className={`fixed inset-0 z-50 flex flex-col ${KIT.bg}`}
-            role="dialog"
-            aria-modal="true"
-            aria-label="Schema graph, full screen"
-          >
-            <div className={`flex h-[52px] flex-shrink-0 items-center justify-between gap-3 border-b ${RULE} pl-5 pr-3`}>
-              <div className="flex min-w-0 items-baseline gap-2.5">
-                <h2 className="text-[15px] font-semibold tracking-[-0.014em] text-zinc-50">Schema graph</h2>
-                <span className="hidden truncate text-[12px] text-zinc-500 sm:inline">
-                  {tables.length} {tables.length === 1 ? 'table' : 'tables'}
-                </span>
-              </div>
-              <IconButton icon={Minimize2} label="Exit full screen" onClick={() => setIsVisualizationExpanded(false)} />
-            </div>
-            <div className="min-h-0 flex-1 overflow-hidden">
-              <EnhancedSchemaVisualizer
-                schema={selectedSchema}
-                databaseType={activeDb}
-                projectId={resolvedProjectId || undefined}
-                view={databaseView}
-              />
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+
 
       {/* ── Insert row ─────────────────────────────────────── */}
       <KitModal
@@ -2359,7 +2388,7 @@ const DATABASE_VIEWS: Array<{ id: DatabaseView; label: string; icon: LucideIcon 
   { id: 'tables', label: 'Tables', icon: Table2 },
   { id: 'visualization', label: 'Schema', icon: Network },
   { id: 'sql', label: 'SQL', icon: Terminal },
-  { id: 'history', label: 'History', icon: History },
+  { id: 'history', label: 'Changes', icon: History },
   { id: 'types', label: 'Types', icon: Shapes },
   { id: 'extensions', label: 'Extensions', icon: Puzzle },
   { id: 'snapshots', label: 'Snapshots', icon: Camera },

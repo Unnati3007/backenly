@@ -1,5 +1,7 @@
 import { NextResponse } from 'next/server'
 import { ZodError } from 'zod'
+import type { QueryContext } from '@/lib/db/query-errors'
+import { refusedDataRequest } from './data-errors'
 
 /**
  * Standard API error response format
@@ -69,11 +71,19 @@ export function createSuccessResponse<T>(
 }
 
 /**
- * Handle Zod validation errors
+ * Handle validation errors: a ZodError keeps its per-field detail, and the
+ * message validateRequestBody already built (what the v1 data routes pass) is
+ * answered as it is. Both are a 400. A string used to reach `error.errors`,
+ * which a string does not have, so every invalid request to those routes
+ * answered 500 "Failed to execute database query" instead.
  */
-export function handleValidationError(error: ZodError): NextResponse<ApiError> {
+export function handleValidationError(error: ZodError | string): NextResponse<ApiError> {
+  if (typeof error === 'string') {
+    return createErrorResponse('VALIDATION_ERROR', error || 'Request validation failed', 400)
+  }
+
   const details: Record<string, string[]> = {}
-  
+
   error.errors.forEach((err) => {
     const path = err.path.join('.')
     if (!details[path]) {
@@ -104,6 +114,16 @@ export function regionErrorResponse(error: unknown): NextResponse<ApiError> | nu
   const code = (error as { code?: unknown } | null | undefined)?.code
   if (code !== 'REGION_NOT_CONFIGURED' && code !== 'UNKNOWN_REGION') return null
   return createErrorResponse(code, "This project's data region is not reachable from this server.", 503)
+}
+
+/**
+ * The answer for a data request refused for what it asked
+ * (lib/api/v1/data-errors.ts): 400 or 409 naming the column; null for any
+ * other error.
+ */
+export function dataRefusalResponse(error: unknown, context?: QueryContext): NextResponse<ApiError> | null {
+  const refused = refusedDataRequest(error, context)
+  return refused ? createErrorResponse(refused.code, refused.message, refused.status, refused.details) : null
 }
 
 /**

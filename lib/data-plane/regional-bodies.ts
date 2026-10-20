@@ -17,6 +17,13 @@
  *   held_action         an action held for the owner's approval: its target (an
  *                       end user's email, a file's path) and its arguments
  *                       (lib/operational-memory/held-action-targets.ts)
+ *   approval_request    a call an agent parked for a human: the agent's request,
+ *                       its target and its exact arguments
+ *                       (lib/mcp/approval-request-bodies.ts)
+ *   change_catalog      a governed change's catalogs with their definitions:
+ *                       function bodies, view queries, CHECK, policy and default
+ *                       expressions, comments and enum labels, which its
+ *                       record keeps only as digests (lib/changes/residency.ts)
  *
  * For a project in the home region all of it stays on the platform rows, as
  * it always has. For a project in another region it never leaves that region
@@ -50,6 +57,8 @@ export type BodyKind =
   | 'backfill_cursor'
   | 'storage_file'
   | 'held_action'
+  | 'approval_request'
+  | 'change_catalog'
 
 /** How long a region keeps a log body (PRUNED_KINDS) after its last change. */
 export const REGIONAL_BODY_RETENTION_DAYS = 30
@@ -60,7 +69,10 @@ export const REGIONAL_BODY_RETENTION_DAYS = 30
  * project keeps them as long as the project. A regional project's are kept the
  * same way, until the messages or the project are deleted. A backfill's cursor
  * is needed only while its chain of batches runs, minutes or hours. A file's
- * names last as long as its row, and so do a held action's target and arguments.
+ * names last as long as its row, and so do a held action's target and arguments
+ * and an approval request's words and call, which the daily cleanup deletes
+ * with the request (lib/queue/worker.ts). A change's catalogs last as long as
+ * its record, which is how long it can be restored and audited.
  */
 const PRUNED_KINDS: BodyKind[] = ['webhook', 'trigger', 'function_run', 'function_error', 'backfill_cursor']
 

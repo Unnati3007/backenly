@@ -8,11 +8,11 @@
  */
 
 import { isReservedWorkspaceTable } from '@/lib/security/workspace-schema'
+import { addForeignKeySql, columnForeignKeySql, describeTarget, isDeclaredForeignKey } from '@/lib/db/declared-foreign-key'
 import { getActiveGraph, saveNewGraph } from '@/lib/orchestration/graph-pointer'
 import { withTimeout } from './with-timeout'
 import { trackAction } from './execution-timeline'
 import { classifyErrorCode } from '@/lib/errors/taxonomy'
-import { generateDomainEndpoints as _generateDomainEndpoints } from './build-runtime/domain-business-logic'
 import { USER_ROLE_ID_BASES as _SEMANTIC_USER_ROLE_ID_BASES, USER_SEMANTIC_COLS as _SEMANTIC_USER_COLS } from './semantic-relations'
 import { writeDecisionEntry, extractFkInferences } from '@/lib/memory/decision-memory'
 import { riskLevelForExecutorAction, queuePendingActionFinding } from '@/lib/operational-memory/ledger'
@@ -3128,6 +3128,21 @@ async function _writeDecisionMemory(action: AIAction, projectId: string): Promis
   })
 }
 
+/**
+ * Actions that can change a workspace's schema, and are therefore governed
+ * changes (lib/changes/ledger.ts): a checkpoint before them, protected
+ * verification after. One that turns out to change nothing leaves no record,
+ * so an action that only sometimes alters the schema belongs here.
+ */
+const SCHEMA_CHANGE_ACTIONS = new Set<AIAction['action']>([
+  'CREATE_TABLE', 'CREATE_JUNCTION_TABLE', 'ADD_COLUMN', 'DROP_COLUMN', 'DROP_TABLE',
+  'RENAME_COLUMN', 'ADD_CONSTRAINT', 'VALIDATE_CONSTRAINT', 'CREATE_INDEX', 'DROP_INDEX',
+  'ALTER_COLUMN_TYPE', 'ENABLE_AUTH', 'ENABLE_TEAMS', 'ENABLE_VECTOR_SEARCH', 'ADD_FULLTEXT_SEARCH',
+  'SET_PERMISSION', 'REMOVE_PERMISSION', 'ENABLE_REALTIME', 'DISABLE_REALTIME',
+  'CREATE_TRIGGER', 'DELETE_TRIGGER', 'SYNC_COLUMN', 'REMOVE_SYNC_COLUMN',
+  'FIX_TABLE', 'FIX_AUTH', 'FIX_REALTIME', 'REGISTER_TABLE', 'RUN_DATA_MIGRATION',
+])
+
 export async function executeAction(
   action: AIAction,
   projectId: string,
@@ -3137,6 +3152,100 @@ export async function executeAction(
   // Autonomy auto-fixes run a single deterministic buildFixAction and must NOT
   // be LLM-replanned into a different action — replanning a failed CREATE_INDEX
   // into a no-op INFO reported a fix that never happened. Chat keeps replanning.
+  allowReplan: boolean = true,
+): Promise<ExecutionResult> {
+  const run = () => executeActionUnrecorded(action, projectId, apiKey, retryCount, executionId, allowReplan)
+  if (!SCHEMA_CHANGE_ACTIONS.has(action.action)) return run()
+
+  // A governed change: checkpoint first, protected verification after, and a
+  // recovery if it fails (lib/changes/ledger.ts). Inside an apply_migration or
+  // a merge this joins that change instead of opening its own (one migration,
+  // one checkpoint), and reports what it did for that change's verification.
+  const { withGovernedChange, expectEffect } = await import('@/lib/changes/ledger')
+  const { ChangeInProgressError } = await import('@/lib/changes/lock')
+  const recorded = async () => {
+    const r = await run()
+    if (r.success) for (const e of expectationsFor(action)) expectEffect(projectId, e)
+    return r
+  }
+  try {
+    const { result, change } = await withGovernedChange(
+      { projectId, title: describeActionForLedger(action) },
+      recorded,
+      (r) => ({
+        ok: r.success,
+        ...(r.success ? {} : { error: r.error ?? r.message }),
+        steps: [{ statement: describeActionForLedger(action), tool: action.action, summary: r.message?.slice(0, 500), ok: r.success }],
+      }),
+    )
+    if (change?.recovery) {
+      // It ran, failed protected verification or failed part-way, and Backenly
+      // acted on that. The caller hears what is true now, not "success".
+      const failing = change.verification?.checks.find((c) => c.outcome === 'contradicted')
+      return {
+        ...result,
+        success: false,
+        message:
+          `${change.summary}: ${failing ? `failed production verification (${failing.label.toLowerCase()}: ${failing.detail}). ` : 'failed part-way. '}` +
+          change.recovery.explanation,
+        error: `CHANGE_${change.status.toUpperCase()}`,
+        code: `CHANGE_${change.status.toUpperCase()}`,
+        change: { id: change.id, seq: change.seq, status: change.status },
+      } as ExecutionResult
+    }
+    return change ? ({ ...result, change: { id: change.id, seq: change.seq, status: change.status } } as ExecutionResult) : result
+  } catch (err) {
+    if (err instanceof ChangeInProgressError) {
+      return { success: false, message: err.message, error: err.code, code: err.code } as ExecutionResult
+    }
+    throw err
+  }
+}
+
+/** What a successful action promised, for protected verification to check against the catalog. */
+function expectationsFor(action: AIAction): Array<{ action: string; table?: string; column?: string; newName?: string }> {
+  const p = (action.params ?? {}) as Record<string, any>
+  const table: string | undefined = p.tableName ?? p.table
+  switch (action.action) {
+    case 'CREATE_TABLE':
+      return table ? [{ action: 'CREATE_TABLE', table }] : []
+    case 'CREATE_JUNCTION_TABLE':
+      return p.junctionName ? [{ action: 'CREATE_TABLE', table: p.junctionName }] : []
+    case 'DROP_TABLE':
+      return table ? [{ action: 'DROP_TABLE', table }] : []
+    case 'ADD_COLUMN': {
+      const column = p.columnName ?? p.column?.name
+      return table && column ? [{ action: 'ADD_COLUMN', table, column }] : []
+    }
+    case 'DROP_COLUMN':
+      return table && p.columnName ? [{ action: 'DROP_COLUMN', table, column: p.columnName }] : []
+    case 'RENAME_COLUMN':
+      return table && p.newName ? [{ action: 'RENAME_COLUMN', table, column: p.oldName, newName: p.newName }] : []
+    // The table whose access rules this step was asked to set (set_rls, add_rls):
+    // what it sets there is the request, not a side effect (lib/changes/verify.ts).
+    case 'SET_PERMISSION':
+    case 'REMOVE_PERMISSION':
+      return table ? [{ action: action.action, table }] : []
+    default:
+      return []
+  }
+}
+
+/** One line for the change history: what was asked for, in the executor's terms. */
+function describeActionForLedger(action: AIAction): string {
+  const p = action.params ?? {}
+  const table = p.tableName ?? p.table ?? p.entity
+  const column = p.columnName ?? p.column?.name
+  const target = [table, column].filter(Boolean).join('.')
+  return `${action.action}${target ? ` ${target}` : ''}`
+}
+
+async function executeActionUnrecorded(
+  action: AIAction,
+  projectId: string,
+  apiKey?: string,
+  retryCount: number = 0,
+  executionId?: string,
   allowReplan: boolean = true,
 ): Promise<ExecutionResult> {
   console.log('[AI Executor] Executing action:', action.action)
@@ -3399,22 +3508,11 @@ async function executeSingleAction(
     }
   }
 
-  // #13 — Schema versioning: snapshot before any schema-mutating action
-  // so every change is reversible with LIST_SCHEMA_VERSIONS / ROLLBACK_TO_VERSION
-  const SCHEMA_MUTATING_ACTIONS = new Set([
-    'CREATE_TABLE', 'CREATE_JUNCTION_TABLE', 'ADD_COLUMN', 'DROP_COLUMN',
-    'RENAME_COLUMN', 'ADD_CONSTRAINT', 'CREATE_INDEX', 'ENABLE_AUTH',
-    'ENABLE_VECTOR_SEARCH', 'ENABLE_TEAMS',
-  ])
-  if (SCHEMA_MUTATING_ACTIONS.has(action.action)) {
-    try {
-      const { snapshotSchema } = await import('@/lib/versioning/schema-versions')
-      const label = action.params?.tableName || action.params?.entity || action.action
-      await snapshotSchema(projectId, `Before ${action.action} on ${label}`, 'ai-executor')
-    } catch {
-      // Non-fatal — snapshot failure must never block execution
-    }
-  }
+  // Schema-changing actions get their restore point from the change ledger,
+  // which wraps executeAction (SCHEMA_CHANGE_ACTIONS above). The per-action
+  // SchemaVersion snapshot that used to be taken here held the catalog only:
+  // rolling back to it dropped the tables and columns added since, with their
+  // data, and could not bring back anything dropped.
 
   try {
     switch (action.action) {
@@ -3710,6 +3808,10 @@ async function executeSingleAction(
         }
 
         // Real run: destructive-class operation → approval gate unless confirmed.
+        // The model cannot set `confirmed`: the tool passes only operations and
+        // dryRun, and the only call that reaches here with it is one a person
+        // approved (lib/mcp/approvals.ts). A brain run holds this answer for
+        // that approval, with the counts below (lib/ai/brain/agent.ts).
         if (!action.params.confirmed) {
           try {
             const estimates = await estimateDataMigration(projectId, ops)
@@ -3720,7 +3822,7 @@ async function executeSingleAction(
               message:
                 `⚠️ This data migration will modify existing rows:\n${lines.join('\n')}\n\n` +
                 `A checkpoint copy of each affected table is taken first, so this is reversible. ` +
-                `Reply **confirm** to apply.`,
+                `It runs once a person approves this exact call; nothing typed in chat approves it.`,
               data: { requiresApproval: true, estimates },
             }
           } catch (err: any) {
@@ -4216,6 +4318,21 @@ async function executeCreateTable(
         let colSql = applyConstraintsToColumn(columnDef, constraints, postgresSchema)
         // Strip FK references — we'll add them in the retroactive pass below
         colSql = colSql.replace(/\s+REFERENCES\s+"[^"]*"\."[^"]*"\("[^"]*"\)[^,;]*/gi, '').trim()
+        // A foreign key declared in a migration is installed exactly as written,
+        // in this same statement, so a key that cannot be created leaves no table
+        // behind (lib/db/declared-foreign-key.ts). A branch is built without
+        // foreign keys, and gets this one when its merge replays the statement.
+        const declaredFk = (col as { references?: unknown }).references
+        if (declaredFk !== undefined && !branchMode) {
+          if (!isDeclaredForeignKey(declaredFk)) {
+            return {
+              success: false,
+              message: `The foreign key declared on "${col.name}" cannot be installed as written, so "${tableName}" was not created.`,
+              error: 'Invalid declared foreign key',
+            }
+          }
+          colSql += ` ${columnForeignKeySql(postgresSchema, tableName, col.name, declaredFk)}`
+        }
         columnDefs.push(colSql)
       }
     }
@@ -4545,6 +4662,8 @@ async function executeCreateTable(
     // up here, before the convention pass, using the target the caller named.
     try {
       for (const { col, constraints } of columnPlans) {
+        // A declared key was installed with the table, exactly as written.
+        if (col?.references !== undefined) continue
         if (typeof col?.fkTo !== 'string' || !col.fkTo.trim()) continue
 
         const target = String(col.fkTo).trim().toLowerCase().split('.')[0]
@@ -5050,46 +5169,14 @@ async function executeGenerateAPI(
     // so the project gets real endpoints like POST /jobs/:id/cancel, not just
     // generic CRUD.  These use pre-written TypeScript templates (no extra
     // OpenAI call) so they are fast and deterministic.
+    // Registered in one place (lib/services/domain-endpoints.ts), because a
+    // restore or reapply registers and removes them as well.
     const _allProjectTables = await prisma.table.findMany({ where: { projectId }, select: { name: true } })
       .then(rows => rows.map(r => r.name)).catch(() => [])
-    const domainEndpoints = _generateDomainEndpoints(tableName, projectId, _allProjectTables)
+    const { registerDomainEndpoints } = await import('@/lib/services/domain-endpoints')
+    const domainEndpoints = await registerDomainEndpoints(projectId, tableName, _allProjectTables)
     if (domainEndpoints.length > 0) {
-      console.log(`[AI Executor] 🎯 Registering ${domainEndpoints.length} domain endpoints for "${tableName}"`)
-      const { prisma: prismaDyn } = await import('@/lib/db')
-      for (const ep of domainEndpoints) {
-        try {
-          const existing = await prismaDyn.aiFunction.findFirst({
-            where: { projectId, name: ep.name },
-            select: { id: true },
-          })
-          if (existing) {
-            await prismaDyn.aiFunction.update({
-              where: { id: existing.id },
-              data: {
-                description: ep.description,
-                generatedCode: ep.code,
-                triggerType: 'manual',
-                triggerTable: `${ep.method} /api/v1/${projectId}/fn/${ep.name}`,
-                status: 'active',
-              },
-            })
-          } else {
-            await prismaDyn.aiFunction.create({
-              data: {
-                projectId,
-                name: ep.name,
-                description: ep.description,
-                generatedCode: ep.code,
-                triggerType: 'manual',
-                triggerTable: `${ep.method} /api/v1/${projectId}/fn/${ep.name}`,
-                status: 'active',
-              },
-            })
-          }
-        } catch (epErr: any) {
-          console.warn(`[AI Executor] Could not register domain endpoint "${ep.name}":`, epErr.message)
-        }
-      }
+      console.log(`[AI Executor] 🎯 Registered ${domainEndpoints.length} domain endpoints for "${tableName}"`)
     }
     // ── END domain endpoints ──────────────────────────────────────────────────
 
@@ -5731,7 +5818,8 @@ async function executeAddColumn(
     // NULL it cannot satisfy (23502), and either way the result is the truth.
     const spec = params.column && typeof params.column === 'object' ? params.column as Record<string, unknown> : null
     const declared = !!spec && colsToAdd.length === 1 &&
-      (spec.nullable === false || spec.default !== undefined || spec.unique === true || typeof spec.fkTo === 'string')
+      (spec.nullable === false || spec.default !== undefined || spec.unique === true || typeof spec.fkTo === 'string' ||
+        spec.references !== undefined)
     if (declared) {
       const name = String(spec!.name ?? colsToAdd[0].name)
       const ident = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/
@@ -5749,7 +5837,14 @@ async function executeAddColumn(
         defaultSql = ` DEFAULT ${d}`
       }
       let referencesSql = ''
-      if (typeof spec!.fkTo === 'string') {
+      const declaredFk = spec!.references
+      if (declaredFk !== undefined) {
+        // Declared in a migration: installed exactly as written (lib/db/declared-foreign-key.ts).
+        if (!isDeclaredForeignKey(declaredFk)) {
+          return { success: false, message: `The foreign key declared on "${name}" cannot be installed as written, so nothing was added.` }
+        }
+        referencesSql = ` ${columnForeignKeySql(postgresSchema, tableName, name, declaredFk)}`
+      } else if (typeof spec!.fkTo === 'string') {
         if (!ident.test(spec!.fkTo)) return { success: false, message: `"${spec!.fkTo}" is not a table this path can reference.` }
         referencesSql = ` REFERENCES "${postgresSchema}"."${spec!.fkTo}"("id")`
       }
@@ -5808,7 +5903,14 @@ async function executeDropTable(params: any, projectId: string): Promise<Executi
     // Count APIs before deletion so we can report the number removed
     const removedApiCount = await prisma.apiDefinition.count({ where: { projectId, name: tableName } }).catch(() => 0)
 
-    await db.$executeRawUnsafe(`DROP TABLE IF EXISTS "${postgresSchema}"."${tableName}" CASCADE`)
+    // Inside a recorded change (every approved drop is one) the table and its
+    // rows move into the change's vault instead of being destroyed, so rolling
+    // the change back brings them back. lib/changes/preserve.ts.
+    const { archiveTable } = await import('@/lib/changes/preserve')
+    const kept = await archiveTable(projectId, postgresSchema, tableName)
+    if (!kept.handled) {
+      await db.$executeRawUnsafe(`DROP TABLE IF EXISTS "${postgresSchema}"."${tableName}" CASCADE`)
+    }
     await prisma.table.deleteMany({ where: { projectId, name: tableName } })
     await prisma.apiDefinition.deleteMany({ where: { projectId, name: tableName } })
     const { supersedeSchemaIntent } = await import('@/lib/autonomy/intent-conformance')
@@ -5842,9 +5944,12 @@ async function executeDropTable(params: any, projectId: string): Promise<Executi
     const apiMsg = removedApiCount > 0 ? ` and removed ${removedApiCount} API definition${removedApiCount !== 1 ? 's' : ''}` : ''
     return {
       success: true,
-      message: `✅ Table \`${tableName}\` dropped permanently${apiMsg}.`,
+      message: kept.handled
+        ? `✅ Table \`${tableName}\` dropped${apiMsg}. Its ${kept.rows} row${kept.rows === 1 ? ' is' : 's are'} kept: ` +
+          `restoring the state before change #${kept.seq} brings the table back with ${kept.rows === 1 ? 'it' : 'them'}.`
+        : `✅ Table \`${tableName}\` dropped permanently${apiMsg}.`,
       diff: { added: [], modified: [], removed: [tableName] },
-      data: { tableName, removedApiCount },
+      data: { tableName, removedApiCount, ...(kept.handled ? { keptRows: kept.rows, change: kept.seq } : {}) },
     }
   } catch (err: any) {
     return { success: false, message: `Failed to drop table: ${err.message}`, error: err.message }
@@ -6160,9 +6265,13 @@ async function executeDropColumn(params: any, projectId: string): Promise<Execut
 
     // CASCADE so any view / trigger / index that references this column is
     // also dropped — without it Postgres refuses on dependent objects.
-    await db.$executeRawUnsafe(
-      `ALTER TABLE "${postgresSchema}"."${tableName}" DROP COLUMN IF EXISTS "${columnName}" CASCADE`
-    )
+    //
+    // Inside a recorded change its values are kept first, in the same
+    // transaction, so rolling the change back restores them row by row.
+    const dropSql = `ALTER TABLE "${postgresSchema}"."${tableName}" DROP COLUMN IF EXISTS "${columnName}" CASCADE`
+    const { keepColumnValues } = await import('@/lib/changes/preserve')
+    const kept = await keepColumnValues(projectId, postgresSchema, tableName, columnName, 'dropped', dropSql)
+    if (!kept.handled) await db.$executeRawUnsafe(dropSql)
 
     // The drop was asked for, so the column is no longer requested: without
     // this the intent ledger would report it missing (lib/autonomy/intent-conformance).
@@ -6187,7 +6296,12 @@ async function executeDropColumn(params: any, projectId: string): Promise<Execut
 
     return {
       success: true,
-      message: `✅ Column \`${columnName}\` dropped from \`${tableName}\`. The REST API was regenerated and old values are gone. This change is reversible via the version history.`,
+      // Says what can actually be undone. It used to call every drop "reversible
+      // via the version history", which could re-add an empty column at best.
+      message: kept.handled
+        ? `✅ Column \`${columnName}\` dropped from \`${tableName}\`. The REST API was regenerated. Its ${kept.rows} ` +
+          `value${kept.rows === 1 ? ' is' : 's are'} kept: restoring the state before change #${kept.seq} brings the column back with them.`
+        : `✅ Column \`${columnName}\` dropped from \`${tableName}\`. The REST API was regenerated and old values are gone.`,
       diff: { added: [], modified: [tableName], removed: [`${tableName}.${columnName}`] },
       verifiedAt: new Date().toISOString(),
     }
@@ -9230,6 +9344,38 @@ async function executeAddConstraint(params: any, projectId: string, schemaTarget
         data: { tableName, columnName, referencedTable: target ?? null, enforcedOnBranch: false },
       }
     }
+    // A foreign key declared in a migration is installed exactly as written:
+    // its referenced column, both actions and its name. fk-repair's rules are
+    // for keys Backenly infers, and their default is ON DELETE CASCADE, which is
+    // how a declared ON DELETE SET NULL used to become one.
+    if (params.references !== undefined) {
+      const fk = params.references
+      if (!isDeclaredForeignKey(fk)) {
+        return {
+          success: false,
+          message: `The foreign key declared on "${tableName}.${columnName}" cannot be installed as written, so nothing was added.`,
+          code: 'FK_FAILED',
+        }
+      }
+      const { getWorkspaceDatabaseNames } = await import('@/lib/services/databaseProvisioning')
+      const sql = addForeignKeySql(getWorkspaceDatabaseNames(projectId).postgresSchema, tableName, columnName, fk)
+      try {
+        await db.$executeRawUnsafe(sql)
+      } catch (err: any) {
+        const reason = err?.meta?.message ?? err?.message ?? String(err)
+        return {
+          success: false,
+          message: `The foreign key ${tableName}.${columnName} → ${describeTarget(fk)} was not added: ${reason}`,
+          error: reason,
+          code: 'FK_FAILED',
+        }
+      }
+      return {
+        success: true,
+        message: `✅ Added foreign key ${tableName}.${columnName} → ${describeTarget(fk)} ON DELETE ${fk.onDelete} ON UPDATE ${fk.onUpdate}`,
+        data: { tableName, columnName, referencedTable: fk.table, referencedColumn: fk.column ?? null, onDelete: fk.onDelete, onUpdate: fk.onUpdate },
+      }
+    }
     const { repairForeignKeyColumn } = await import('./fk-repair')
     const r = await repairForeignKeyColumn(projectId, tableName, columnName, target)
     return r.success
@@ -9919,11 +10065,12 @@ async function executeCreateTrigger(params: any, projectId: string): Promise<Exe
   // A webhook trigger without a destination used to be CREATED and reported as
   // "calls your webhook at `undefined`"; every later matching write then threw
   // 'webhook trigger requires webhookUrl' and logged a DEAD delivery. Refuse
-  // at creation, where the caller can still fix it.
-  if (actionType === 'webhook' && !(typeof webhookUrl === 'string' && /^https?:\/\//i.test(webhookUrl.trim()))) {
+  // at creation, where the caller can still fix it. https only: each delivery
+  // carries the row that fired it.
+  if (actionType === 'webhook' && !(typeof webhookUrl === 'string' && /^https:\/\//i.test(webhookUrl.trim()))) {
     return {
       success: false,
-      message: 'A webhook trigger needs webhookUrl — the http(s) endpoint it calls. Pass webhookUrl, or use create_webhook for a signed row webhook.',
+      message: 'A webhook trigger needs webhookUrl — the https:// endpoint it calls. Pass webhookUrl, or use create_webhook for a signed row webhook.',
     }
   }
 
@@ -9938,8 +10085,23 @@ async function executeCreateTrigger(params: any, projectId: string): Promise<Exe
     // per source table.
     const existing = await prisma.appTrigger.findFirst({
       where: { projectId, name },
-      select: { id: true, name: true, sourceTable: true, event: true },
+      select: { id: true, name: true, sourceTable: true, event: true, webhookUrl: true },
     }).catch(() => null)
+    // The name comes from the table and the event, so asking again with a
+    // different URL lands here too. "Nothing to do" kept the old destination,
+    // or none for a trigger stored before the URL was required, while the
+    // caller believed the new one was set.
+    if (existing && actionType === 'webhook' && (existing.webhookUrl ?? '').trim() !== webhookUrl.trim()) {
+      return {
+        success: false,
+        message:
+          `Trigger "${existing.name}" already exists on \`${existing.sourceTable}.${existing.event}\` and calls ` +
+          `${existing.webhookUrl ? `\`${existing.webhookUrl}\`` : 'no URL'}, not \`${webhookUrl}\`. Nothing was changed. ` +
+          'To send these events to the new URL, delete it with delete_trigger and create it again.',
+        code: 'TRIGGER_CONFLICT',
+        data: { triggerId: existing.id, name: existing.name, existingWebhookUrl: existing.webhookUrl, requestedWebhookUrl: webhookUrl },
+      }
+    }
     if (existing) {
       return {
         success: true,
@@ -9987,7 +10149,12 @@ async function executeListTriggers(projectId: string): Promise<ExecutionResult> 
     }
 
     const lines = triggers.map(t => {
-      const arrow = t.actionType === 'webhook' ? `→ webhook` : `→ ${t.actionType} in ${t.targetTable || '?'}`
+      // Where a webhook trigger posts is what there is to check, and the
+      // brain's model reads this text, not `data`: without the URL, a trigger
+      // calling the wrong address, or none, read the same as a working one.
+      const arrow = t.actionType === 'webhook'
+        ? `→ webhook ${t.webhookUrl ? `\`${t.webhookUrl}\`` : '(no URL, so nothing is delivered)'}`
+        : `→ ${t.actionType} in ${t.targetTable || '?'}`
       const status = t.enabled ? '✅' : '⏸️'
       return `${status} **${t.name}**: \`${t.sourceTable}.${t.event}\` ${arrow}`
     })
@@ -11409,69 +11576,46 @@ async function executeToggleAiFunction(params: any, projectId: string): Promise<
 // ─── Schema Version History (#13) ─────────────────────────────────────────────
 
 /**
- * LIST_SCHEMA_VERSIONS: Show all saved schema snapshots for this project
+ * LIST_SCHEMA_VERSIONS: the schema change history from the change ledger.
  */
 async function executeListSchemaVersions(projectId: string): Promise<ExecutionResult> {
   try {
-    const { listSchemaVersions } = await import('@/lib/versioning/schema-versions')
-    const versions = await listSchemaVersions(projectId)
-
-    if (versions.length === 0) {
+    const { listChanges } = await import('@/lib/changes/history')
+    const { changes, windowDays } = await listChanges(projectId, { limit: 10 })
+    if (changes.length === 0) {
       return {
         success: true,
-        message: 'No schema versions recorded yet. Versions are saved automatically before each schema change.',
-        data: { versions: [] },
+        message: 'No changes recorded yet. Each one is recorded with a checkpoint as it is made.',
+        data: { changes: [] },
       }
     }
-
-    const lines = versions.slice(0, 10).map(v => {
-      const date = new Date(v.createdAt).toLocaleString()
-      return `  v${v.versionNum} — ${date}: ${v.description}`
-    })
-
+    const lines = changes.map((c) =>
+      `  #${c.seq} · ${c.outcome.state} · ${new Date(c.createdAt).toLocaleString()} · ${c.actor.label}: ${c.summary}`)
     return {
       success: true,
-      message: `Schema version history (${versions.length} versions):\n${lines.join('\n')}\n\nTo rollback: "rollback to version 3" or "undo the auth I added"`,
-      data: { versions },
+      message:
+        `Change history (newest first):\n${lines.join('\n')}\n\n` +
+        'A person restores the state before a change from Database → Changes, or a coding agent asks for it with ' +
+        'deploy { action: "revert_change", changeId } for a person to approve.',
+      data: { changes, windowDays },
     }
   } catch (error: any) {
-    return { success: false, message: `Failed to list versions: ${error.message}`, error: error.message }
+    return { success: false, message: `Failed to list schema changes: ${error.message}`, error: error.message }
   }
 }
 
 /**
- * ROLLBACK_TO_VERSION: Revert schema to a specific version
- * params: { versionNum?: number, versionId?: string, description?: string }
+ * ROLLBACK_TO_VERSION: never executes. Rolling back production is a person's
+ * decision; this says where it is made instead of making it.
  */
-async function executeRollbackToVersion(params: any, projectId: string): Promise<ExecutionResult> {
-  try {
-    const { listSchemaVersions, rollbackToVersion } = await import('@/lib/versioning/schema-versions')
-
-    let targetVersionId = params.versionId
-
-    // Resolve by version number if ID not provided
-    if (!targetVersionId && params.versionNum) {
-      const versions = await listSchemaVersions(projectId)
-      const match = versions.find(v => v.versionNum === Number(params.versionNum))
-      if (!match) {
-        return { success: false, message: `Version ${params.versionNum} not found. Use "show schema history" to see available versions.` }
-      }
-      targetVersionId = match.id
-    }
-
-    if (!targetVersionId) {
-      return { success: false, message: 'Specify a version number: "rollback to version 3" or "show schema history" to see versions.' }
-    }
-
-    const result = await rollbackToVersion(projectId, targetVersionId)
-
-    return {
-      success: result.success,
-      message: result.message,
-      data: { statementsExecuted: result.statementsExecuted },
-    }
-  } catch (error: any) {
-    return { success: false, message: `Rollback failed: ${error.message}`, error: error.message }
+async function executeRollbackToVersion(_params: any, _projectId: string): Promise<ExecutionResult> {
+  return {
+    success: false,
+    error: 'ROLLBACK_NEEDS_A_PERSON',
+    message:
+      'The state before a change is restored one change at a time, by a person: open Database → Changes and use ' +
+      '"Restore previous state" on the change, or request it with deploy { action: "revert_change", changeId } and it ' +
+      'waits for approval. Nothing was changed.',
   }
 }
 
@@ -14001,10 +14145,6 @@ async function executeAlterColumnType(params: any, projectId: string): Promise<E
     const { postgresSchema } = getWorkspaceDatabaseNames(projectId)
     const safe = (s: string) => s.replace(/[^a-z0-9_]/gi, '')
 
-    // Snapshot before mutating
-    const { snapshotSchema } = await import('@/lib/versioning/schema-versions')
-    await snapshotSchema(projectId, `Before ALTER COLUMN TYPE ${tableName}.${columnName} → ${newType}`, 'ai-executor').catch(() => {})
-
     const normalizedType = normalizeColumnType(newType, columnName)
 
     // Smart USING clause for common type migrations
@@ -14045,12 +14185,18 @@ async function executeAlterColumnType(params: any, projectId: string): Promise<E
       || USING_CLAUSES[normalizedType]?.[currentType]
       || `"${safe(columnName)}"::${normalizedType}`
 
-    await db.$executeRawUnsafe(`
+    // A cast need not round-trip (numeric → integer rounds, text → date
+    // normalises), so inside a recorded change the original values are kept
+    // first and a rollback puts back exactly what was there.
+    const alterSql = `
       ALTER TABLE "${postgresSchema}"."${safe(tableName)}"
       ALTER COLUMN "${safe(columnName)}"
       TYPE ${normalizedType}
       USING ${usingExpr}
-    `)
+    `
+    const { keepColumnValues } = await import('@/lib/changes/preserve')
+    const kept = await keepColumnValues(projectId, postgresSchema, safe(tableName), safe(columnName), 'retyped', alterSql)
+    if (!kept.handled) await db.$executeRawUnsafe(alterSql)
 
     // Invalidate schema cache
     const { invalidateSchemaCache } = await import('@/lib/services/workspace-validator')

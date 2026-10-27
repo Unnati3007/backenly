@@ -8617,10 +8617,9 @@ async function executeVacuumTable(params: any, projectId: string): Promise<Execu
  *     project's workspace schema, so a name collision across tenants cannot
  *     reach anyone else's catalog.
  *
- * CONCURRENTLY is deliberately NOT used, and the reason is not caution: it
- * cannot run inside a transaction block, and every governed mutation here does.
- * A plain DROP INDEX takes a brief ACCESS EXCLUSIVE lock on the table, which is
- * the cost of the approved change and is stated in the result.
+ * CONCURRENTLY is not used here: dropping an index merely removes metadata
+ * from the catalog, so an ACCESS EXCLUSIVE lock on the index/table is very brief
+ * compared to building an index over table data.
  */
 async function executeDropIndex(params: any, projectId: string): Promise<ExecutionResult> {
   const db = await projectDb(projectId)
@@ -8991,11 +8990,14 @@ async function executeCreateIndex(params: any, projectId: string, target: Schema
     wherePredicate = checked.expression
   }
 
+  let postgresSchema: string | undefined
+  let idxName: string | undefined
+
   try {
     const { getWorkspaceDatabaseNames } = await import('@/lib/services/databaseProvisioning')
-    const postgresSchema = target.targetSchema ?? getWorkspaceDatabaseNames(projectId).postgresSchema
+    postgresSchema = target.targetSchema ?? getWorkspaceDatabaseNames(projectId).postgresSchema
 
-    const idxName = params.indexName || defaultIndexName(tableName, columns, unique)
+    idxName = params.indexName || defaultIndexName(tableName, columns, unique)
     const colList = columns.map((c) => `"${c}"`).join(', ')
     const usingClause = method ? ` USING ${method}` : ''
 
@@ -9028,55 +9030,112 @@ async function executeCreateIndex(params: any, projectId: string, target: Schema
 
     const whereClause = effectiveWhere ? ` WHERE (${effectiveWhere})` : ''
     const ddl =
-      `CREATE${unique ? ' UNIQUE' : ''} INDEX IF NOT EXISTS "${idxName}" ` +
+      `CREATE${unique ? ' UNIQUE' : ''} INDEX CONCURRENTLY IF NOT EXISTS "${idxName}" ` +
       `ON "${postgresSchema}"."${tableName}"${usingClause} (${colList})${whereClause}`
 
-    // ── Name-collision check BEFORE creating ────────────────────────────────
+    // ── Name-collision & invalid-index check BEFORE creating ─────────────────
     // `IF NOT EXISTS` matches on NAME only. If an index of this name already
     // exists over different columns — or without UNIQUE — Postgres returns
-    // success and leaves the old one in place. That is exactly how a "created"
-    // unique index turned out to be a pre-existing non-unique one.
-    const existing = await db.$queryRawUnsafe<Array<{ indexdef: string }>>(
-      `SELECT indexdef FROM pg_indexes WHERE schemaname = $1 AND tablename = $2 AND indexname = $3`,
+    // success and leaves the old one in place.
+    //
+    // Furthermore, if a previous concurrent build failed, Postgres leaves behind
+    // an INVALID index (pg_index.indisvalid = false). pg_indexes lists it too,
+    // and `IF NOT EXISTS` would skip creating, leaving the broken index in place.
+    // We check pg_index.indisvalid: an invalid index is dropped and rebuilt,
+    // while a matching valid index reports "already exists".
+    const existing = await db.$queryRawUnsafe<Array<{
+      indexname: string
+      is_valid: boolean
+      indexdef: string
+    }>>(
+      `SELECT c.relname AS indexname,
+              ix.indisvalid AS is_valid,
+              pg_get_indexdef(c.oid) AS indexdef
+         FROM pg_index ix
+         JOIN pg_class c ON c.oid = ix.indexrelid
+         JOIN pg_class t ON t.oid = ix.indrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND t.relname = $2 AND c.relname = $3`,
       postgresSchema, tableName, idxName,
-    )
+    ).catch(() => [] as any[])
+
     if (existing.length > 0) {
-      const def = existing[0].indexdef
-      const sameUnique = /CREATE UNIQUE/i.test(def) === unique
-      const sameCols = indexDefColumns(def).join(',') === columns.map((c) => c.toLowerCase()).join(',')
-      if (sameUnique && sameCols) {
-        return {
-          success: true,
-          message: `Index "${idxName}" already exists on ${tableName} (${columns.join(', ')})${unique ? ', unique' : ''} — nothing to do.`,
-          data: { tableName, columns, unique, indexName: idxName, alreadyExisted: true, definition: def },
+      if (!existing[0].is_valid) {
+        // An invalid index was left behind from a previous failed build.
+        // It cannot be used by the planner, so drop it before rebuilding.
+        await db.$executeRawUnsafe(
+          `DROP INDEX CONCURRENTLY IF EXISTS "${postgresSchema}"."${idxName}"`,
+        ).catch(() => {})
+      } else {
+        const def = existing[0].indexdef
+        const sameUnique = /CREATE UNIQUE/i.test(def) === unique
+        const sameCols = indexDefColumns(def).join(',') === columns.map((c) => c.toLowerCase()).join(',')
+        if (sameUnique && sameCols) {
+          return {
+            success: true,
+            message: `Index "${idxName}" already exists on ${tableName} (${columns.join(', ')})${unique ? ', unique' : ''} — nothing to do.`,
+            data: { tableName, columns, unique, indexName: idxName, alreadyExisted: true, definition: def },
+          }
         }
-      }
-      return {
-        success: false,
-        message:
-          `An index named "${idxName}" already exists on ${tableName} with a DIFFERENT definition, ` +
-          `so the requested one was not created.\n` +
-          `  existing:  ${def}\n` +
-          `  requested: ${unique ? 'UNIQUE ' : ''}(${columns.join(', ')})\n` +
-          `Pass a different indexName, or drop the existing index first (destructive — route it through backend_chat).`,
-        error: 'Index name conflict',
-        code: 'INDEX_CONFLICT',
-        data: { indexName: idxName, existingDefinition: def, requested: { columns, unique } },
+        return {
+          success: false,
+          message:
+            `An index named "${idxName}" already exists on ${tableName} with a DIFFERENT definition, ` +
+            `so the requested one was not created.\n` +
+            `  existing:  ${def}\n` +
+            `  requested: ${unique ? 'UNIQUE ' : ''}(${columns.join(', ')})\n` +
+            `Pass a different indexName, or drop the existing index first (destructive — route it through backend_chat).`,
+          error: 'Index name conflict',
+          code: 'INDEX_CONFLICT',
+          data: { indexName: idxName, existingDefinition: def, requested: { columns, unique } },
+        }
       }
     }
 
-    await db.$executeRawUnsafe(ddl)
+    // Set lock_timeout to avoid waiting indefinitely if another transaction holds
+    // an incompatible lock on the table. Reset in finally.
+    await db.$executeRawUnsafe(`SET lock_timeout = '10s'`).catch(() => {})
+    try {
+      await db.$executeRawUnsafe(ddl)
+    } finally {
+      await db.$executeRawUnsafe(`RESET lock_timeout`).catch(() => {})
+    }
 
     // ── Verify, do not assume ───────────────────────────────────────────────
-    const after = await db.$queryRawUnsafe<Array<{ indexdef: string }>>(
-      `SELECT indexdef FROM pg_indexes WHERE schemaname = $1 AND tablename = $2 AND indexname = $3`,
+    // Assert both presence in the catalog and that the index was built VALID.
+    const after = await db.$queryRawUnsafe<Array<{
+      indexname: string
+      is_valid: boolean
+      indexdef: string
+    }>>(
+      `SELECT c.relname AS indexname,
+              ix.indisvalid AS is_valid,
+              pg_get_indexdef(c.oid) AS indexdef
+         FROM pg_index ix
+         JOIN pg_class c ON c.oid = ix.indexrelid
+         JOIN pg_class t ON t.oid = ix.indrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND t.relname = $2 AND c.relname = $3`,
       postgresSchema, tableName, idxName,
-    )
+    ).catch(() => [] as any[])
+
     if (after.length === 0) {
       return {
         success: false,
-        message: `CREATE INDEX reported no error but "${idxName}" is not in the catalog.`,
+        message: `CREATE INDEX CONCURRENTLY reported no error but "${idxName}" is not in the catalog.`,
         error: 'Index not created',
+        code: 'VERIFY_FAILED',
+      }
+    }
+    if (!after[0].is_valid) {
+      // The build did not complete cleanly and left an invalid index. Clean it up.
+      await db.$executeRawUnsafe(
+        `DROP INDEX CONCURRENTLY IF EXISTS "${postgresSchema}"."${idxName}"`,
+      ).catch(() => {})
+      return {
+        success: false,
+        message: `Index "${idxName}" was created but is marked INVALID in pg_index (build failed). The invalid index was removed.`,
+        error: 'Index marked invalid',
         code: 'VERIFY_FAILED',
       }
     }
@@ -9120,6 +9179,24 @@ async function executeCreateIndex(params: any, projectId: string, target: Schema
       },
     }
   } catch (error: any) {
+    // A failed concurrent build can leave an invalid index behind in Postgres.
+    // Clean it up so it does not block future builds or clutter pg_index.
+    if (postgresSchema && idxName) {
+      await db.$executeRawUnsafe(
+        `DROP INDEX CONCURRENTLY IF EXISTS "${postgresSchema}"."${idxName}"`,
+      ).catch(() => {})
+    }
+
+    if (error?.code === '55P03' || /lock_not_available|lock timeout/i.test(error?.message ?? '')) {
+      return {
+        success: false,
+        message:
+          `Cannot build index "${idxName || params.indexName || 'unknown'}" on ${tableName} concurrently: lock acquisition timed out ` +
+          `because the table has active conflicting transactions. The operation was aborted without leaving an invalid index.`,
+        error: error.message,
+        code: 'LOCK_TIMEOUT',
+      }
+    }
     // A duplicate-key failure on CREATE UNIQUE INDEX means the table already
     // holds rows that violate the requested uniqueness. That is the single most
     // useful thing to say, and "Failed to create index: <pg error>" buried it.
